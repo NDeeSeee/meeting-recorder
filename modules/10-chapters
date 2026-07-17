@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""10-chapters — topical chapter markers for a recorded meeting.
+
+Outputs in MEETING_DIR:
+  <base>_chapters.json  machine readable [{start,start_seconds,title,blurb}, ...]
+  <base>_chapters.md    human readable "[00:04:12] Title — blurb"
+  and embeds real chapter markers into <base>.mkv (stream-copy remux).
+
+Contract: see ../meeting-modules/README.md — idempotent, fail-soft, never
+destroys the source recording.
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MAX_TRANSCRIPT_CHARS = 120_000  # plenty for a multi-hour meeting
+
+
+def log(msg):
+    print(f"[10-chapters] {msg}", flush=True)
+
+
+def die(msg, code=1):
+    log(f"ERROR: {msg}")
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def ffprobe_json(path, *args):
+    p = run(["ffprobe", "-v", "error", "-of", "json", *args, path])
+    if p.returncode != 0:
+        raise RuntimeError(f"ffprobe failed on {path}: {p.stderr.strip()}")
+    return json.loads(p.stdout or "{}")
+
+
+def probe_streams(path):
+    """(duration_seconds, [(codec_type, codec_name, title), ...]) — the remux fingerprint.
+
+    The audio track titles ("Microphone", "Meeting audio", ...) are how later
+    modules tell the mic track from the system track, so they are part of what
+    the post-remux verification has to prove was preserved.
+    """
+    info = ffprobe_json(path, "-show_format", "-show_streams")
+    dur = float(info.get("format", {}).get("duration") or 0.0)
+    streams = [(s.get("codec_type"), s.get("codec_name"), (s.get("tags") or {}).get("title"))
+               for s in info.get("streams", [])]
+    return dur, streams
+
+
+def probe_nchapters(path):
+    try:
+        return len(ffprobe_json(path, "-show_chapters").get("chapters", []))
+    except Exception:
+        return 0
+
+
+def hms(seconds):
+    seconds = int(seconds)
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def parse_hms(value):
+    """'HH:MM:SS' / 'H:MM:SS' / 'MM:SS' -> seconds, or None."""
+    if isinstance(value, bool):  # bool is an int subclass; True would become 1s
+        return None
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if not isinstance(value, str):
+        return None
+    m = re.match(r"^\s*\[?(?:(\d+):)?(\d{1,2}):(\d{1,2})\]?\s*$", value)
+    if not m:
+        return None
+    h, mn, s = m.group(1) or 0, m.group(2), m.group(3)
+    return int(h) * 3600 + int(mn) * 60 + int(s)
+
+
+# --------------------------------------------------------------------------
+# Claude
+# --------------------------------------------------------------------------
+
+PROMPT = """You are segmenting a recorded meeting transcript into topical chapters, \
+like YouTube chapter markers, so someone can jump straight to the part they care about.
+
+The transcript is on stdin. Each line is "[HH:MM:SS] Speaker: text", where "You" is the \
+person who recorded it and "Participants" is everyone else. The recording is {duration} long.
+
+Produce between 4 and 12 chapters covering the whole meeting in order.
+
+Rules for titles:
+- A title MUST name the actual subject matter discussed in that stretch — the specific \
+project, dataset, tool, problem, decision or person.
+- NEVER use generic titles. "Introduction", "Discussion", "General discussion", "Wrap-up", \
+"Next steps", "Q&A", "Conclusion", "Overview", "Main topic" are all FORBIDDEN. If the opening \
+is audio checks and small talk, call it what it is, e.g. "Audio check and screen-share setup".
+- Titles are short (3-8 words), no trailing punctuation.
+- The blurb is ONE sentence saying what actually happens in that chapter.
+- The "start" MUST be a real timestamp copied from the transcript, in HH:MM:SS, non-decreasing, \
+and within the recording length. The first chapter starts at 00:00:00.
+
+Output ONLY a JSON array. No markdown fences, no prose, no explanation before or after:
+[{{"start": "00:00:00", "title": "...", "blurb": "..."}}]"""
+
+RETRY_SUFFIX = """
+
+CRITICAL: your previous reply was not valid JSON. Reply with the raw JSON array and \
+absolutely nothing else. The first character of your reply must be '[' and the last must be ']'."""
+
+
+def extract_json_array(text):
+    """Pull a JSON array out of a Claude reply that may be fenced or chatty."""
+    if not text or not text.strip():
+        return None
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S)
+    candidates = []
+    if fence:
+        candidates.append(fence.group(1))
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    candidates.append(text)
+    for cand in candidates:
+        try:
+            data = json.loads(cand.strip())
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("chapters"), list):
+            return data["chapters"]
+    return None
+
+
+def claude_bin():
+    """The pipeline exports a minimal PATH that omits ~/.local/bin, where claude lives."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/claude")
+    if os.access(fallback, os.X_OK):
+        return fallback
+    return None
+
+
+def ask_claude(transcript, duration_s, retry):
+    exe = claude_bin()
+    if not exe:
+        log("claude CLI not found on PATH or in ~/.local/bin")
+        return None
+    prompt = PROMPT.format(duration=hms(duration_s))
+    if retry:
+        prompt += RETRY_SUFFIX
+    p = subprocess.run(
+        [exe, "-p", prompt],
+        input=transcript, capture_output=True, text=True, timeout=900,
+    )
+    if p.returncode != 0:
+        log(f"claude exited {p.returncode}: {p.stderr.strip()[:300]}")
+        return None
+    return extract_json_array(p.stdout)
+
+
+GENERIC = {
+    "introduction", "intro", "discussion", "general discussion", "wrap up", "wrap-up",
+    "wrapup", "next steps", "q&a", "questions", "conclusion", "overview", "main topic",
+    "opening", "closing", "meeting", "misc", "miscellaneous", "other",
+}
+
+
+def sanitize(raw, duration_s):
+    """Validate/clamp Claude's chapters against the real recording length."""
+    if not isinstance(raw, list) or not raw:
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        start = parse_hms(item.get("start") if item.get("start") is not None else item.get("timestamp"))
+        # Claude can hand back non-strings here (title: 123, blurb: {...}); never
+        # let a bad field type crash the module — just treat it as absent.
+        raw_title = item.get("title")
+        raw_blurb = item.get("blurb")
+        title = raw_title.strip().strip("-–—").strip() if isinstance(raw_title, str) else ""
+        blurb = " ".join(raw_blurb.split()) if isinstance(raw_blurb, str) else ""
+        if start is None or not title:
+            continue
+        # Drop anything outside the real recording (leave 1s of room at the end).
+        if start >= duration_s - 1:
+            log(f"dropping chapter beyond recording end: {hms(start)} {title!r}")
+            continue
+        if title.lower().rstrip(".") in GENERIC:
+            log(f"dropping generic chapter title: {title!r}")
+            continue
+        out.append({"start_seconds": max(0, start), "title": title, "blurb": blurb})
+
+    out.sort(key=lambda c: c["start_seconds"])
+    # Enforce strictly increasing starts: collapse duplicates/near-duplicates.
+    deduped = []
+    for c in out:
+        if deduped and c["start_seconds"] - deduped[-1]["start_seconds"] < 1:
+            continue
+        deduped.append(c)
+    if not deduped:
+        return []
+    deduped[0]["start_seconds"] = 0  # first chapter must anchor the file start
+    for c in deduped:
+        c["start"] = hms(c["start_seconds"])
+    return [{"start": c["start"], "start_seconds": c["start_seconds"],
+             "title": c["title"], "blurb": c["blurb"]} for c in deduped]
+
+
+# --------------------------------------------------------------------------
+# mkv embedding
+# --------------------------------------------------------------------------
+
+def ffmetadata(chapters, duration_s):
+    lines = [";FFMETADATA1"]
+    for i, c in enumerate(chapters):
+        start_ms = c["start_seconds"] * 1000
+        nxt = chapters[i + 1]["start_seconds"] * 1000 if i + 1 < len(chapters) else int(duration_s * 1000)
+        end_ms = max(start_ms + 1000, nxt)
+        title = c["title"].replace("\\", "\\\\").replace("=", "\\=").replace(";", "\\;").replace("#", "\\#").replace("\n", " ")
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start_ms}", f"END={end_ms}", f"title={title}"]
+    return "\n".join(lines) + "\n"
+
+
+def embed_chapters(mkv, chapters, duration_s, workdir):
+    """Remux the mkv with chapter markers. Returns True only if verified + swapped."""
+    orig_dur, orig_streams = probe_streams(mkv)
+    meta_path = os.path.join(workdir, "chapters.ffmetadata")
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        fh.write(ffmetadata(chapters, duration_s))
+
+    # Temp output must live beside the mkv so the final mv is an atomic same-volume rename.
+    tmp_out = os.path.join(os.path.dirname(mkv), f".{os.path.basename(mkv)}.chapters.tmp.mkv")
+    try:
+        # -map_metadata 0 keeps the recording's own global tags; only the chapters
+        # come from input 1. (-map_metadata 1 would silently wipe them.)
+        try:
+            p = run(["ffmpeg", "-nostdin", "-y", "-v", "error",
+                     "-i", mkv, "-i", meta_path,
+                     "-map", "0", "-map_metadata", "0", "-map_chapters", "1",
+                     "-codec", "copy", tmp_out], timeout=3600)
+        except subprocess.TimeoutExpired:
+            log("ffmpeg remux timed out; keeping original")
+            return False
+        if p.returncode != 0:
+            log(f"ffmpeg remux failed: {p.stderr.strip()[:400]}")
+            return False
+
+        new_dur, new_streams = probe_streams(tmp_out)
+        n_ch = probe_nchapters(tmp_out)
+        if new_streams != orig_streams:
+            log(f"remux stream mismatch: {orig_streams} -> {new_streams}; keeping original")
+            return False
+        if abs(new_dur - orig_dur) > 1.0:
+            log(f"remux duration mismatch: {orig_dur:.2f} -> {new_dur:.2f}; keeping original")
+            return False
+        if n_ch != len(chapters):
+            log(f"remux produced {n_ch} chapters, expected {len(chapters)}; keeping original")
+            return False
+        if os.path.getsize(tmp_out) < os.path.getsize(mkv) * 0.9:
+            log("remux output suspiciously small; keeping original")
+            return False
+
+        os.replace(tmp_out, mkv)  # atomic within the directory
+        log(f"embedded {n_ch} chapter markers into {os.path.basename(mkv)} "
+            f"(streams {len(new_streams)}, duration {new_dur:.1f}s)")
+        return True
+    finally:
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+
+
+def write_atomic(path, text):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".chapters-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def main():
+    meeting_dir = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MEETING_DIR", "")).rstrip("/")
+    if not meeting_dir or not os.path.isdir(meeting_dir):
+        die(f"usage: 10-chapters <MEETING_DIR>  (got {meeting_dir!r})", 2)
+
+    base = os.environ.get("MEETING_BASE") or os.path.basename(meeting_dir)
+    mkv = os.environ.get("MEETING_MKV") or os.path.join(meeting_dir, f"{base}.mkv")
+    txt = os.environ.get("MEETING_TXT") or os.path.join(meeting_dir, f"{base}.txt")
+    out_json = os.path.join(meeting_dir, f"{base}_chapters.json")
+    out_md = os.path.join(meeting_dir, f"{base}_chapters.md")
+
+    have_files = os.path.exists(out_json) and os.path.exists(out_md)
+    have_embed = os.path.exists(mkv) and probe_nchapters(mkv) > 0
+    if have_files and have_embed:
+        log("chapters already present (files + mkv markers) — nothing to do")
+        return 0
+
+    if not os.path.exists(txt) or os.path.getsize(txt) == 0:
+        die(f"transcript missing or empty: {txt}")
+    if not os.path.exists(mkv):
+        die(f"recording missing: {mkv}")
+
+    duration_s, _ = probe_streams(mkv)
+    if duration_s <= 0:
+        die(f"could not determine duration of {mkv}")
+
+    chapters = None
+    if have_files:
+        # Files exist but the mkv has no markers (earlier remux failed / mkv replaced).
+        # Reuse the existing chapters rather than paying for Claude again.
+        try:
+            with open(out_json, encoding="utf-8") as fh:
+                chapters = sanitize(json.load(fh).get("chapters"), duration_s)
+            log(f"reusing {len(chapters)} existing chapters; only the mkv embed is missing")
+        except Exception as exc:
+            log(f"existing {os.path.basename(out_json)} unreadable ({exc}); regenerating")
+            chapters = None
+
+    if not chapters:
+        with open(txt, encoding="utf-8", errors="replace") as fh:
+            transcript = fh.read()[:MAX_TRANSCRIPT_CHARS]
+        for attempt in (0, 1):
+            log(f"asking claude for chapters (attempt {attempt + 1}/2, {hms(duration_s)} recording)")
+            try:
+                raw = ask_claude(transcript, duration_s, retry=bool(attempt))
+            except subprocess.TimeoutExpired:
+                log("claude timed out")
+                raw = None
+            chapters = sanitize(raw, duration_s)
+            if chapters:
+                break
+            log("claude did not return usable JSON chapters")
+        if not chapters:
+            die("no valid chapters after 2 attempts")
+
+    md = [f"# Chapters — {base}", ""]
+    md += [f"- [{c['start']}] {c['title']} — {c['blurb']}".rstrip(" —") for c in chapters]
+    md.append("")
+    payload = {"base": base, "duration_seconds": round(duration_s, 3), "chapters": chapters}
+
+    write_atomic(out_json, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    write_atomic(out_md, "\n".join(md))
+    log(f"wrote {len(chapters)} chapters -> {os.path.basename(out_md)}, {os.path.basename(out_json)}")
+
+    workdir = tempfile.mkdtemp(prefix="chapters-")
+    try:
+        if not embed_chapters(mkv, chapters, duration_s, workdir):
+            log("mkv chapter embedding skipped/failed — original recording left untouched")
+            return 1
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

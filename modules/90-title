@@ -1,0 +1,195 @@
+#!/bin/zsh
+# 90-title — rename the meeting folder to a content-based, human-scannable name.
+#
+#   2026-07-14_12-33_meeting  ->  2026-07-14_colorectal-atlas-review
+#
+# Runs LAST (after every other module has written its outputs). It renames the
+# FOLDER only — never the files inside it: MEETING_BASE stays the stable
+# identifier that the Obsidian note and every other artifact references.
+#
+# Slug source, in order of authority:
+#   1. <base>_calendar.json  (a real calendar event title beats anything guessed)
+#   2. `claude -p` over the summary's TL;DR
+# A slug that fails sanitisation is rejected and the folder is left alone.
+
+set -u
+setopt null_glob
+
+MEETING_DIR="${1:?usage: 90-title <MEETING_DIR>}"
+MEETING_DIR="${MEETING_DIR%/}"
+: "${MEETING_BASE:=${MEETING_DIR:t}}"
+: "${MEETING_ROOT:=${MEETING_DIR:h}}"
+: "${MEETING_SUMMARY:=$MEETING_DIR/${MEETING_BASE}_summary.md}"
+
+MAXLEN=40
+say() { print -r -- "[90-title] $*"; }
+
+[[ -d "$MEETING_DIR" ]] || { say "no such dir: $MEETING_DIR"; exit 1; }
+
+# --- idempotency (cheap, first) --------------------------------------------
+# Either the marker exists, or the folder no longer looks like raw OBS output.
+if [[ -f "$MEETING_DIR/.titled" ]]; then
+    exit 0
+fi
+if [[ "${MEETING_DIR:t}" != *_meeting ]]; then
+    say "already named (${MEETING_DIR:t}) — nothing to do"
+    exit 0
+fi
+
+[[ -s "$MEETING_SUMMARY" ]] || { say "no summary — skipping"; exit 0; }
+
+# --- date prefix ------------------------------------------------------------
+# Keep the leading YYYY-MM-DD so chronological sort survives the rename.
+DATE="${${MEETING_BASE}%%_*}"
+if [[ ! "$DATE" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ]]; then
+    DATE="${${MEETING_DIR:t}%%_*}"
+fi
+if [[ ! "$DATE" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ]]; then
+    say "no usable date prefix in '${MEETING_BASE}' — refusing to rename"
+    exit 0
+fi
+
+# --- sanitiser --------------------------------------------------------------
+# Unicode -> ASCII, lowercase, [a-z0-9-] only, <=5 words, <=MAXLEN chars,
+# no leading/trailing/repeated dashes. Prints nothing if the result is garbage.
+slugify() { # slugify <raw text> [strict]   (argv, not stdin: the heredoc owns stdin)
+    # strict = the text is untrusted model output: only accept a line that is
+    # ALREADY slug-shaped. Prose ("I cannot determine a good slug...") must be
+    # rejected, not mangled into a folder name.
+    RAW="$1" MODE="${2:-lenient}" MAXLEN="$MAXLEN" python3 <<'PY'
+import os, re, sys, unicodedata
+
+raw = os.environ.get("RAW", "")
+mode = os.environ.get("MODE", "lenient")
+maxlen = int(os.environ.get("MAXLEN", "40"))
+
+def undecorate(l):
+    l = l.strip().strip('`"\'').strip()
+    # tolerate a "Slug: foo-bar" / "Title: foo-bar" label
+    l = re.sub(r'^(?:slug|title)\s*:\s*', '', l, flags=re.I).strip()
+    return l.strip('`"\'').strip()
+
+lines = [undecorate(l) for l in raw.splitlines() if l.strip()]
+lines = [l for l in lines if l]
+if not lines:
+    sys.exit(0)
+
+if mode == "strict":
+    # Accept only a bare kebab-case token of 1-5 words. Anything else is prose.
+    cands = [l for l in lines
+             if re.fullmatch(r'[A-Za-z0-9]+(?:-[A-Za-z0-9]+){0,4}', l)]
+    if not cands:
+        sys.exit(0)
+    s = cands[0]
+else:
+    s = lines[-1]
+
+s = unicodedata.normalize("NFKD", s)
+s = s.encode("ascii", "ignore").decode("ascii").lower()
+s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+if not s:
+    sys.exit(0)
+
+words = [w for w in s.split("-") if w][:5]
+s = "-".join(words)
+if len(s) > maxlen:                       # truncate on a word boundary
+    keep = []
+    for w in words:
+        cand = "-".join(keep + [w])
+        if len(cand) > maxlen:
+            break
+        keep.append(w)
+    s = "-".join(keep) if keep else words[0][:maxlen]
+s = s.strip("-")
+
+# Reject garbage rather than produce a bad folder name.
+BAD = {"", "meeting", "meetings", "untitled", "none", "null", "n-a", "na",
+       "unknown", "call", "zoom", "recording", "no-title", "slug"}
+if (len(s) < 3 or s in BAD or not re.search(r"[a-z]", s)
+        or re.fullmatch(r"[0-9-]+", s)):
+    sys.exit(0)
+print(s)
+PY
+}
+
+# --- 1. calendar event title (authoritative) --------------------------------
+title=""
+cal="$MEETING_DIR/${MEETING_BASE}_calendar.json"
+if [[ -s "$cal" ]] && command -v jq >/dev/null 2>&1; then
+    # Tolerate whatever shape 70-calendar wrote; ignore explicit non-matches.
+    if ! jq -e '(.matched == false) or (.match == null and has("match"))' "$cal" >/dev/null 2>&1; then
+        title=$(jq -r '[.title?, .summary?, .event?.title?, .event?.summary?,
+                        .event?.subject?, .subject?]
+                       | map(select(type == "string" and (. | gsub("^\\s+|\\s+$";"")) != ""))
+                       | first // empty' "$cal" 2>/dev/null)
+    fi
+    [[ -n "$title" ]] && say "calendar title: $title"
+fi
+
+slug=""
+if [[ -n "$title" ]]; then
+    slug=$(slugify "$title")
+    [[ -z "$slug" ]] && say "calendar title did not survive sanitisation; falling back"
+fi
+
+# --- 2. ask claude for a slug from the summary ------------------------------
+if [[ -z "$slug" ]]; then
+    say "asking claude for a slug"
+    raw=$(claude -p 'This is a meeting summary. Reply with ONE kebab-case slug (3-5 words, lowercase ASCII letters/digits/hyphens only) naming what the meeting was actually about. Be specific to the content — never generic words like "meeting", "call", "discussion", "sync" alone. Output the slug and nothing else: no quotes, no explanation.' \
+          < "$MEETING_SUMMARY" 2>/dev/null)
+    if [[ -n "$raw" ]]; then
+        # Untrusted model output: reject anything that is not already a slug.
+        slug=$(slugify "$raw" strict)
+        [[ -z "$slug" ]] && say "claude did not return a usable slug"
+        # No human title here — the raw reply is model output, not a title.
+        # `human` falls back to the slug below.
+    fi
+fi
+
+if [[ -z "$slug" ]]; then
+    say "no usable slug — leaving folder alone"
+    exit 0
+fi
+say "slug: $slug"
+
+# --- human title file (written before the rename, inside the folder) --------
+human="${title:-$slug}"
+human="${human//$'\n'/ }"
+tmpt="$MEETING_DIR/.${MEETING_BASE}_title.txt.$$"
+print -r -- "$human" > "$tmpt" && mv -f "$tmpt" "$MEETING_DIR/${MEETING_BASE}_title.txt" \
+    || { rm -f "$tmpt"; say "could not write title file"; exit 1; }
+
+# --- collision-safe rename --------------------------------------------------
+target="$MEETING_ROOT/${DATE}_${slug}"
+if [[ "$target" == "$MEETING_DIR" ]]; then
+    : > "$MEETING_DIR/.titled"
+    exit 0
+fi
+if [[ -e "$target" ]]; then
+    for n in {2..99}; do
+        cand="$MEETING_ROOT/${DATE}_${slug}-${n}"
+        [[ -e "$cand" ]] || { target="$cand"; break; }
+    done
+fi
+if [[ -e "$target" ]]; then
+    say "cannot find a free name for ${DATE}_${slug} — leaving folder alone"
+    exit 0
+fi
+
+# `mv src dst` would move src *into* dst if dst existed as a directory, so the
+# -e check above is load-bearing; -n is a second belt-and-braces guard.
+if ! mv -n "$MEETING_DIR" "$target"; then
+    say "rename failed: $MEETING_DIR -> $target"
+    exit 1
+fi
+if [[ ! -d "$target" || -d "$MEETING_DIR" ]]; then
+    say "rename did not take effect — aborting"
+    exit 1
+fi
+
+# The orchestrator reads this to follow the move for the rest of this run.
+print -r -- "$target" > "$MEETING_ROOT/.last-rename"
+: > "$target/.titled"
+
+say "renamed: ${MEETING_DIR:t} -> ${target:t}"
+exit 0

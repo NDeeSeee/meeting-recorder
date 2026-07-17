@@ -1,0 +1,724 @@
+#!/bin/zsh
+# meeting-maintenance — global maintenance pass for the meeting pipeline.
+#
+# Runs ONCE at the end of every meeting-process invocation (not per meeting).
+# Env in: MEETING_ROOT, MEETING_TOOLS, MEETING_LOG.
+#
+#   1. DISK AUTOPILOT   old .mkv -> H.265 mp4 -> (much later) audio-only.
+#                       Only ever touches meetings whose transcript AND summary
+#                       already exist, and only ever deletes after verifying the
+#                       replacement. This is the whole safety story: the video is
+#                       the raw material, the text is the value — we never trade
+#                       away a recording whose text extraction failed.
+#   2. WEEKLY DIGEST    once a week, a Monday-morning briefing at
+#                       $MEETING_ROOT/_weekly-digest.md
+#   3. HEALTH CHECK     broken artifacts, silent participant tracks, disk usage,
+#                       index staleness -> log + notification on problems.
+#
+# Unattended by design: no dry-run default, no prompts. Every destructive step is
+# verify-then-delete with the bytes reclaimed logged.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+setopt null_glob
+
+# --- tunables --------------------------------------------------------------
+TRANSCODE_AFTER_DAYS=${TRANSCODE_AFTER_DAYS:-7}    # mkv -> H.265 mp4
+AUDIO_ONLY_AFTER_DAYS=${AUDIO_ONLY_AFTER_DAYS:-90} # video -> .m4a (needs slides/)
+DIGEST_EVERY_DAYS=${DIGEST_EVERY_DAYS:-7}          # weekly digest cadence
+HEVC_BITRATE=${HEVC_BITRATE:-900k}                 # screen-share content, 900k is plenty
+AUDIO_BITRATE=${AUDIO_BITRATE:-96k}                # only used if audio must be re-encoded
+DURATION_TOLERANCE=${DURATION_TOLERANCE:-1}        # seconds; mp4 must match the mkv
+MIN_SHRINK_RATIO=${MIN_SHRINK_RATIO:-95}           # keep mp4 only if <= 95% of original
+SILENCE_DB=${SILENCE_DB:--85}                      # mean_volume at/below this = silent
+# A transcode that produced a file this small (relative, per-minute) is bogus.
+MIN_BYTES_PER_MINUTE=${MIN_BYTES_PER_MINUTE:-20000}
+# A transcript/summary smaller than this is a failed stub ("Error: rate limited"),
+# not text. The video is the raw material — we do not trade it for a stub.
+MIN_TXT_BYTES=${MIN_TXT_BYTES:-200}
+MIN_SUMMARY_BYTES=${MIN_SUMMARY_BYTES:-200}
+# Hard ceilings. Nothing here may block forever: this runs from a background
+# process with no one to notice, and a hung ffmpeg would wedge the pipeline.
+FFPROBE_TIMEOUT=${FFPROBE_TIMEOUT:-60}
+FFMPEG_TIMEOUT=${FFMPEG_TIMEOUT:-7200}
+CLAUDE_TIMEOUT=${CLAUDE_TIMEOUT:-300}
+
+MEETING_ROOT="${MEETING_ROOT:-$HOME/Documents/GitHub/BruceLab/docs/Meetings}"
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+MEETING_LOG="${MEETING_LOG:-$HOME/Library/Logs/meeting-process.log}"
+
+STATE="$MEETING_TOOLS/maintenance"
+mkdir -p "$STATE/silence" "$STATE/declined" || exit 1
+
+DIGEST="$MEETING_ROOT/_weekly-digest.md"
+LAST_DIGEST="$STATE/last-digest"
+
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') [maintenance] $*" >> "$MEETING_LOG"; }
+notify() { # <title> <message>
+    /usr/bin/osascript -e "display notification \"${2//\"/\\\"}\" with title \"${1//\"/\\\"}\"" \
+        >/dev/null 2>&1
+}
+# -L: follow symlinks. A recording may legitimately be a symlink into another
+# volume; without -L stat reports the link's own 100-odd bytes and every size /
+# age decision below is made on the wrong number.
+bytes()   { /usr/bin/stat -Lf%z "$1" 2>/dev/null || print 0; }
+mtime()   { /usr/bin/stat -Lf%m "$1" 2>/dev/null || print 0; }
+age_days() { # <file> -> whole days since mtime
+    local m=$(mtime "$1") now=$(date +%s)
+    (( m == 0 )) && { print 0; return; }
+    print $(( (now - m) / 86400 ))
+}
+# Bound an external command. Unattended means nobody is watching: an ffmpeg that
+# wedges on a corrupt frame, or a `claude` waiting on a network that never
+# answers, would otherwise hang the pipeline until reboot. -k: SIGKILL if it
+# ignores the TERM. Exit status is preserved (124 on timeout -> treated as failure).
+if (( $+commands[timeout] ));       then BOUND=(timeout -k 10)
+elif (( $+commands[gtimeout] ));    then BOUND=(gtimeout -k 10)
+else BOUND=()
+fi
+# The command is run in the BACKGROUND and waited on, rather than in the
+# foreground. zsh defers a trap until the current foreground command returns — so
+# with a foreground ffmpeg, a SIGTERM to this script would sit unhandled for the
+# rest of the transcode (potentially hours) and only then run the cleanup trap.
+# Backgrounding it means `wait` is interruptible: the TERM handler fires at once,
+# kills the child, and removes the half-written temp.
+BOUND_PID=""
+bound() { # <seconds> <cmd...>
+    local secs="$1"; shift
+    if (( ${#BOUND} )); then "${BOUND[@]}" "$secs" "$@" & else "$@" & fi
+    BOUND_PID=$!
+    wait $BOUND_PID
+    local rc=$?
+    BOUND_PID=""
+    return $rc
+}
+# Kill whatever external command is in flight, drop the temp, and go. Used by the
+# destructive paths; `timeout` forwards the TERM on to ffmpeg itself.
+abort_cleanup() {
+    trap - TERM INT
+    [[ -n "$BOUND_PID" ]] && kill -TERM "$BOUND_PID" 2>/dev/null
+    [[ -n "$CUR_TMP" ]] && rm -f "$CUR_TMP" 2>/dev/null
+}
+# Age of the MEETING, not of a given file. Anchored on the transcript, which is
+# written once at transcription and never modified again. Anchoring on the video
+# would be wrong: once the transcode rewrites it, the meeting would look brand
+# new and would never progress to the audio-only tier.
+#
+# mtime alone is NOT trustworthy: a restore from backup, an rsync -t, a Git
+# checkout, an iCloud/Dropbox re-materialisation or a clock skew can stamp a
+# brand-new transcript with an old mtime — and a meeting that merely *looks* 90
+# days old gets its video deleted on the very first run. So we take the SMALLEST
+# age any available signal supports: the folder name carries the recording date
+# (YYYY-MM-DD..., preserved by the rename in module 90). If any signal says
+# "this is recent", we keep the video. Erring young only ever costs disk.
+# (The video's own mtime is deliberately NOT a signal: the transcode rewrites it,
+# which would reset the clock and no meeting would ever reach the audio-only tier.)
+name_age_days() { # <dir> -> age from the YYYY-MM-DD prefix of the folder name; fails if none
+    local n="${1:t}"
+    [[ "$n" =~ '^([0-9]{4}-[0-9]{2}-[0-9]{2})' ]] || return 1
+    local e
+    # /bin/date pinned: BSD -j -f parses, GNU -d does not take these flags.
+    e=$(/bin/date -j -f '%Y-%m-%d %H:%M:%S' "${match[1]} 00:00:00" +%s 2>/dev/null) || return 1
+    [[ "$e" == <-> ]] || return 1
+    print $(( ($(date +%s) - e) / 86400 ))
+}
+meeting_age_days() { # <dir>; uses resolved M_TXT / M_VIDEO
+    local a=-1 na
+    if   [[ -n "$M_TXT" ]];   then a=$(age_days "$M_TXT")
+    elif [[ -n "$M_VIDEO" ]]; then a=$(age_days "$M_VIDEO")
+    else print 0; return; fi
+    if na=$(name_age_days "$1"); then (( na < a )) && a=$na; fi
+    print $a
+}
+human() { # <bytes> -> e.g. 1.2 GB
+    local b=$1
+    if   (( b >= 1073741824 )); then printf '%.2f GB' $(( b / 1073741824.0 ))
+    elif (( b >= 1048576 ));    then printf '%.1f MB' $(( b / 1048576.0 ))
+    else printf '%d B' "$b"; fi
+}
+duration() { # <media> -> seconds (float, "" if unreadable)
+    local v
+    v=$(bound $FFPROBE_TIMEOUT ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null) || return 1
+    # ffprobe happily prints "N/A" for a container it cannot measure. That is not a
+    # number, and feeding it to $(( )) below would explode mid-verification.
+    [[ "$v" =~ '^[0-9]+(\.[0-9]+)?$' ]] || return 1
+    print -r -- "$v"
+}
+naudio() { # <media> -> number of audio streams (0 if unreadable)
+    local n
+    n=$(bound $FFPROBE_TIMEOUT ffprobe -v error -select_streams a \
+            -show_entries stream=index -of csv=p=0 "$1" 2>/dev/null | grep -c .) || true
+    [[ "$n" == <-> ]] || n=0
+    print -r -- "$n"
+}
+
+# Collect health findings as we go; reported (and notified) at the end.
+typeset -a PROBLEMS
+typeset -i RECLAIMED=0
+# In-flight temp file, so a TERM/INT never leaves a full-size half-written video.
+CUR_TMP=""
+M_TEXT_OK=0; M_TEXT_WHY=""
+
+# ---------------------------------------------------------------------------
+# Meeting enumeration. Same discovery rule as meeting-process: a `.meeting`
+# marker, or the original OBS naming. Anything else in the folder (the old
+# ZoomMeeting_* dirs) is none of our business — and certainly not ours to delete.
+# ---------------------------------------------------------------------------
+typeset -a MEETINGS
+for d in "$MEETING_ROOT"/*(/); do
+    [[ -f "$d/.meeting" || "${d:t}" == *_meeting ]] || continue
+    MEETINGS+=("${d%/}")
+done
+
+# For a meeting dir, resolve the artifact set. Sets globals: M_BASE M_TXT
+# M_SUMMARY M_VIDEO (mkv or mp4, "" if none) M_M4A M_SLIDES M_TEXT_OK M_TEXT_WHY.
+#
+# M_TXT / M_SUMMARY mean "the file exists and is non-empty" — that is what the
+# health check reports on. M_TEXT_OK is the stronger claim the DESTRUCTIVE paths
+# require: the text is plausibly a real extraction rather than a failed stub.
+# `claude -p` and the transcriber both fail by writing something short
+# ("Error: rate limited", "I'm unable to..."), which is non-empty and would sail
+# straight through an -s test — and then we would delete the recording that was
+# the only way to ever produce the real text.
+text_is_real() { # sets M_TEXT_OK / M_TEXT_WHY
+    M_TEXT_OK=0; M_TEXT_WHY=""
+    if [[ -z "$M_TXT" ]];     then M_TEXT_WHY="transcript missing or empty"; return 1; fi
+    if [[ -z "$M_SUMMARY" ]]; then M_TEXT_WHY="summary missing or empty";    return 1; fi
+    local tb=$(bytes "$M_TXT") sb=$(bytes "$M_SUMMARY")
+    if (( tb < MIN_TXT_BYTES )); then
+        M_TEXT_WHY="transcript is a stub (${tb}B < ${MIN_TXT_BYTES}B)"; return 1
+    fi
+    # A real transcript is timestamped ("[00:01:47] You: ..."). No timestamped
+    # line at all means whatever wrote this was not the transcriber.
+    if ! grep -qE '^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\]' "$M_TXT"; then
+        M_TEXT_WHY="transcript has no timestamped lines — not a real transcript"; return 1
+    fi
+    if (( sb < MIN_SUMMARY_BYTES )); then
+        M_TEXT_WHY="summary is a stub (${sb}B < ${MIN_SUMMARY_BYTES}B)"; return 1
+    fi
+    M_TEXT_OK=1; return 0
+}
+resolve() {
+    local d="$1"
+    M_BASE=""; M_TXT=""; M_SUMMARY=""; M_VIDEO=""; M_M4A=""; M_SLIDES=""
+    M_TEXT_OK=0; M_TEXT_WHY=""
+    local -a c
+    # The base name is whichever media/transcript stem the folder actually has.
+    c=("$d"/*.mkv); [[ -n "${c[1]:-}" ]] && { M_VIDEO="${c[1]}"; M_BASE="${c[1]:t:r}"; }
+    if [[ -z "$M_BASE" ]]; then
+        c=("$d"/*.mp4); [[ -n "${c[1]:-}" ]] && { M_VIDEO="${c[1]}"; M_BASE="${c[1]:t:r}"; }
+    fi
+    # Prefer the .m4a stem over a .txt stem: the folder is full of sidecar .txt
+    # files from other modules (*_title.txt), and the first one alphabetically is
+    # not necessarily the transcript.
+    if [[ -z "$M_BASE" ]]; then
+        c=("$d"/*.m4a); [[ -n "${c[1]:-}" ]] && M_BASE="${c[1]:t:r}"
+    fi
+    if [[ -z "$M_BASE" ]]; then
+        # Only a stem that actually has a summary beside it is the meeting stem.
+        for f in "$d"/*.txt; do
+            [[ -f "$d/${f:t:r}_summary.md" ]] && { M_BASE="${f:t:r}"; break; }
+        done
+        if [[ -z "$M_BASE" ]]; then
+            c=("$d"/*.txt); [[ -n "${c[1]:-}" ]] && M_BASE="${c[1]:t:r}"
+        fi
+    fi
+    [[ -n "$M_BASE" ]] || return 1
+    [[ -s "$d/$M_BASE.txt" ]]           && M_TXT="$d/$M_BASE.txt"
+    [[ -s "$d/${M_BASE}_summary.md" ]]  && M_SUMMARY="$d/${M_BASE}_summary.md"
+    [[ -s "$d/$M_BASE.m4a" ]]           && M_M4A="$d/$M_BASE.m4a"
+    [[ -d "$d/slides" ]] && c=("$d"/slides/*(.)) && (( ${#c} )) && M_SLIDES="$d/slides"
+    text_is_real
+    return 0
+}
+
+# ===========================================================================
+# PURPOSE 1 — DISK AUTOPILOT
+# ===========================================================================
+
+# Verify a freshly written mp4 really is a faithful, playable replacement before
+# we let go of the only copy of the original. Checks, in order of how badly they
+# would burn us: duration drift, missing streams, absurdly small file.
+verify_replacement() { # <new> <orig-duration> <orig-bytes> <expect-audio-streams>
+    local new="$1" odur="$2" obytes="$3" oaud="$4"
+    [[ -s "$new" ]] || { print -r -- "output missing or empty"; return 1; }
+
+    local ndur=$(duration "$new")
+    [[ -n "$ndur" ]] || { print -r -- "output has no readable duration"; return 1; }
+    local drift=$(( ${odur:-0} - ndur ))
+    drift=${drift#-}
+    if (( drift > DURATION_TOLERANCE )); then
+        printf 'duration drift %.2fs (orig %.2fs, new %.2fs)' "$drift" "${odur:-0}" "$ndur"
+        return 1
+    fi
+
+    local nvid naud
+    nvid=$(bound $FFPROBE_TIMEOUT ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$new" | grep -c .)
+    naud=$(naudio "$new")
+    (( nvid >= 1 )) || { print -r -- "no video stream in output"; return 1; }
+    # Track 2 = mic ("You"), track 3 = system audio ("Participants"). Lose or
+    # reorder those and every future re-run of speaker separation is broken, with
+    # the original already gone. Count is necessary but not sufficient — also
+    # require each track to be individually decodable, in order.
+    if (( oaud < 1 )); then print -r -- "source audio track count unknown"; return 1; fi
+    if (( naud != oaud )); then
+        print -r -- "audio track count changed ($oaud -> $naud)"; return 1
+    fi
+    local i
+    for (( i = 0; i < naud; i++ )); do
+        if ! bound $FFPROBE_TIMEOUT ffprobe -v error -select_streams a:$i \
+                -show_entries stream=codec_type -of csv=p=0 "$new" 2>/dev/null | grep -q '^audio$'; then
+            print -r -- "audio track a:$i unreadable in output"; return 1
+        fi
+    done
+
+    local nbytes=$(bytes "$new")
+    local mins=$(( ${odur:-60} / 60.0 ))
+    (( mins < 1 )) && mins=1
+    local floor=$(( MIN_BYTES_PER_MINUTE * mins ))
+    if (( nbytes < floor )); then
+        print -r -- "output implausibly small ($(human $nbytes) for ${odur}s)"; return 1
+    fi
+    if (( nbytes * 100 > obytes * MIN_SHRINK_RATIO )); then
+        print -r -- "no meaningful size win ($(human $obytes) -> $(human $nbytes))"; return 1
+    fi
+    return 0
+}
+
+transcode_old_mkv() { # <dir>
+    local d="$1"
+    resolve "$d" || return 0
+    [[ "$M_VIDEO" == *.mkv ]] || return 0                 # already mp4 / audio-only: no-op
+
+    # THE conditional: never trade a recording away for text that doesn't exist —
+    # and a failed stub is text that doesn't exist.
+    (( M_TEXT_OK )) || return 0   # health check reports this separately
+
+    # A symlinked recording is not ours to reclaim. The bytes live on another
+    # volume, so transcoding would ADD bytes here, and `rm` would delete only the
+    # link — silently orphaning the user's real file while the log claims we
+    # reclaimed hundreds of megabytes we never touched. Leave it entirely alone.
+    if [[ -L "$M_VIDEO" ]]; then
+        log "SKIP ${d:t}: recording is a symlink (${M_VIDEO:A}) — not ours to transcode or delete"
+        return 0
+    fi
+
+    local age=$(meeting_age_days "$d")
+    (( age >= TRANSCODE_AFTER_DAYS )) || return 0
+
+    local obytes=$(bytes "$M_VIDEO")
+
+    # A verification rejection is deterministic: the same source will produce the
+    # same unacceptable mp4 next run. Without this, every pipeline invocation
+    # re-transcodes the whole recording (minutes of CPU on a real 800 MB mkv) and
+    # throws the result away, forever. Remember the refusal, keyed by source size
+    # so a replaced/re-recorded file is reconsidered.
+    local decline="$STATE/declined/${d:t}"
+    if [[ -f "$decline" && "$(cat "$decline" 2>/dev/null)" == "$obytes" ]]; then
+        PROBLEMS+=("${d:t}: transcode refused by verification on an earlier run — not retrying (rm '$decline' to force)")
+        return 0
+    fi
+
+    # Reap temp files from a run that was killed mid-transcode; they are dot-files
+    # so nothing else sees them, but they are full-size and would leak forever.
+    local stale
+    for stale in "$d"/.*.transcode.*.mp4(.mh+24N) "$d"/.*.audio.*.m4a(.mh+24N); do rm -f "$stale"; done
+
+    local odur
+    if ! odur=$(duration "$M_VIDEO") || [[ -z "$odur" ]]; then
+        log "SKIP ${d:t}: cannot read duration of source; leaving mkv alone"
+        PROBLEMS+=("${d:t}: unreadable recording (ffprobe cannot get duration)")
+        return 0
+    fi
+    local oaud=$(naudio "$M_VIDEO")
+    if (( oaud < 1 )); then
+        log "SKIP ${d:t}: source has no readable audio tracks; leaving mkv alone"
+        PROBLEMS+=("${d:t}: recording has no readable audio tracks")
+        return 0
+    fi
+
+    local tmp="$d/.$M_BASE.transcode.$$.mp4"
+    local final="$d/$M_BASE.mp4"
+    log "transcoding ${d:t} (${age}d old, $(human $obytes), ${oaud} audio tracks) -> H.265"
+
+    # A SIGTERM mid-transcode must not leave a full-size half-written temp behind.
+    # (It is dot-prefixed so nothing else sees it, but it is the size of the whole
+    # recording.) Clean it up on the way out, whichever way we go out.
+    CUR_TMP="$tmp"
+    trap 'abort_cleanup; exit 143' TERM
+    trap 'abort_cleanup; exit 130' INT
+
+    # Keep every audio track and the chapters. Audio is already AAC, so stream-copy
+    # it: no generation loss, and the video is where all the bytes are anyway.
+    if ! bound $FFMPEG_TIMEOUT ffmpeg -nostdin -y -loglevel error -i "$M_VIDEO" \
+            -map 0:v -map 0:a -map_chapters 0 \
+            -c:v hevc_videotoolbox -b:v "$HEVC_BITRATE" -tag:v hvc1 \
+            -c:a copy -movflags +faststart \
+            "$tmp" >> "$MEETING_LOG" 2>&1; then
+        log "FAIL ${d:t}: ffmpeg transcode failed or timed out; original kept"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        PROBLEMS+=("${d:t}: H.265 transcode failed")
+        return 0
+    fi
+
+    local why
+    if ! why=$(verify_replacement "$tmp" "$odur" "$obytes" "$oaud"); then
+        log "FAIL ${d:t}: verification rejected the mp4 ($why); ORIGINAL KEPT"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        print -r -- "$obytes" > "$decline"   # deterministic: do not burn the CPU again
+        PROBLEMS+=("${d:t}: transcode verification failed ($why)")
+        return 0
+    fi
+    rm -f "$decline"
+
+    local nbytes=$(bytes "$tmp")
+    # Verified good: publish atomically, then (and only then) drop the original.
+    # Both live in $d, so the mv is a rename(2) — there is no window in which the
+    # meeting has neither a video nor a complete replacement.
+    if ! mv -f "$tmp" "$final"; then
+        log "FAIL ${d:t}: could not move mp4 into place; ORIGINAL KEPT"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        PROBLEMS+=("${d:t}: could not publish transcoded mp4")
+        return 0
+    fi
+    CUR_TMP=""; trap - TERM INT
+    rm -f "$M_VIDEO"
+    local saved=$(( obytes - nbytes ))
+    (( RECLAIMED += saved ))
+    log "OK ${d:t}: $(human $obytes) -> $(human $nbytes), ${oaud} audio tracks intact, reclaimed $(human $saved)"
+}
+
+audio_only_old_meeting() { # <dir>
+    local d="$1"
+    resolve "$d" || return 0
+    [[ -n "$M_VIDEO" ]] || return 0                       # already audio-only
+    (( M_TEXT_OK )) || return 0                           # same conditional as above
+    if [[ -L "$M_VIDEO" ]]; then
+        log "SKIP ${d:t}: recording is a symlink — not ours to delete"
+        return 0
+    fi
+
+    local age=$(meeting_age_days "$d")
+    (( age >= AUDIO_ONLY_AFTER_DAYS )) || return 0
+
+    # The video may still hold irreplaceable visual content (slides, screen share).
+    # Only discard it once that content has been extracted somewhere else.
+    if [[ -z "$M_SLIDES" ]]; then
+        log "HOLD ${d:t}: ${age}d old but slides/ not extracted — keeping video"
+        return 0
+    fi
+
+    local obytes=$(bytes "$M_VIDEO")
+    local odur oaud
+    if ! odur=$(duration "$M_VIDEO") || [[ -z "$odur" ]]; then
+        log "HOLD ${d:t}: unreadable duration; keeping video"; return 0
+    fi
+    oaud=$(naudio "$M_VIDEO")
+    if (( oaud < 1 )); then
+        log "HOLD ${d:t}: source has no readable audio tracks; keeping video"; return 0
+    fi
+
+    local tmp="$d/.$M_BASE.audio.$$.m4a"
+    local final="$d/$M_BASE.m4a"
+    log "archiving ${d:t} (${age}d old, ${oaud} audio tracks) to audio-only"
+
+    CUR_TMP="$tmp"
+    trap 'abort_cleanup; exit 143' TERM
+    trap 'abort_cleanup; exit 130' INT
+
+    # Keep every audio track here too — the mic/participants split is what makes
+    # a re-transcribe possible later.
+    if ! bound $FFMPEG_TIMEOUT ffmpeg -nostdin -y -loglevel error -i "$M_VIDEO" -vn -map 0:a -c:a copy "$tmp" \
+            >> "$MEETING_LOG" 2>&1; then
+        # Some codecs will not stream-copy into m4a; re-encode as a fallback.
+        if ! bound $FFMPEG_TIMEOUT ffmpeg -nostdin -y -loglevel error -i "$M_VIDEO" -vn -map 0:a -c:a aac -b:a "$AUDIO_BITRATE" "$tmp" \
+                >> "$MEETING_LOG" 2>&1; then
+            log "FAIL ${d:t}: audio extraction failed or timed out; video kept"
+            rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+            PROBLEMS+=("${d:t}: audio-only archive failed")
+            return 0
+        fi
+    fi
+
+    # This deletes the video for good, so it gets the SAME verification the mp4
+    # replacement gets — duration, and above all the track count. `-map 0:a` is
+    # supposed to carry all N tracks across; if it ever carried fewer (a codec the
+    # m4a muxer quietly drops, a truncated write, a full disk), speaker separation
+    # would be permanently broken on every future re-run with no video to redo it
+    # from. Count the tracks BEFORE letting go of the only copy.
+    local adur aaud abytes drift
+    abytes=$(bytes "$tmp")
+    aaud=$(naudio "$tmp")
+    if ! adur=$(duration "$tmp") || [[ -z "$adur" ]]; then
+        log "FAIL ${d:t}: extracted audio has no readable duration; VIDEO KEPT"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        PROBLEMS+=("${d:t}: audio-only verification failed (unreadable)")
+        return 0
+    fi
+    drift=$(( odur - adur )); drift=${drift#-}
+    local why=""
+    if   (( aaud != oaud ));               then why="audio track count changed ($oaud -> $aaud)"
+    elif (( drift > DURATION_TOLERANCE )); then why="duration drift ${drift}s (orig ${odur}s, new ${adur}s)"
+    elif (( abytes < 10000 ));             then why="output implausibly small ($(human $abytes))"
+    fi
+    if [[ -n "$why" ]]; then
+        log "FAIL ${d:t}: extracted audio failed verification ($why); VIDEO KEPT"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        PROBLEMS+=("${d:t}: audio-only verification failed ($why)")
+        return 0
+    fi
+
+    if ! mv -f "$tmp" "$final"; then
+        log "FAIL ${d:t}: could not publish m4a; VIDEO KEPT"
+        rm -f "$tmp"; CUR_TMP=""; trap - TERM INT
+        PROBLEMS+=("${d:t}: could not publish audio-only archive")
+        return 0
+    fi
+    CUR_TMP=""; trap - TERM INT
+    rm -f "$M_VIDEO"
+    (( RECLAIMED += obytes - abytes ))
+    log "OK ${d:t}: video dropped (slides preserved), ${aaud} audio tracks kept $(human $abytes), reclaimed $(human $(( obytes - abytes )))"
+}
+
+for d in "${MEETINGS[@]}"; do
+    transcode_old_mkv "$d"
+    audio_only_old_meeting "$d"
+done
+(( RECLAIMED > 0 )) && log "disk autopilot reclaimed $(human $RECLAIMED) this run"
+
+# ===========================================================================
+# PURPOSE 3 — HEALTH CHECK  (runs before the digest so problems make it into it)
+# ===========================================================================
+
+# volumedetect reads the whole track, so cache the verdict per meeting keyed by
+# file size — a recording never changes once OBS has closed it.
+participants_silent() { # <dir> <video> -> 0 if the participants track is silent
+    local d="$1" v="$2"
+    local key="$STATE/silence/${d:t}"
+    local sz=$(bytes "$v")
+    if [[ -f "$key" ]]; then
+        local cached_sz cached_val
+        IFS=$'\t' read -r cached_sz cached_val < "$key"
+        [[ "$cached_sz" == "$sz" ]] && { [[ "$cached_val" == silent ]]; return $?; }
+    fi
+    local n=$(naudio "$v")
+    # NB: printf, not `print -r` — `-r` is raw, it would write a literal "\t" and
+    # the cache would never match, so volumedetect (a full decode of the audio)
+    # would re-run on every recording on every pipeline invocation.
+    (( n >= 3 )) || { printf '%s\t%s\n' "$sz" ok > "$key"; return 1; }
+    local mean=$(bound $FFMPEG_TIMEOUT ffmpeg -nostdin -i "$v" -map 0:a:2 -af volumedetect -f null - 2>&1 \
+                 | sed -n 's/.*mean_volume: \([^ ]*\) dB.*/\1/p')
+    # A decode that timed out or died tells us nothing — do not cache a verdict.
+    [[ -n "$mean" ]] || { rm -f "$key"; return 1; }
+    local val=ok
+    # A digitally-silent float track reports "-inf", which is not a number: treat
+    # it as silent rather than letting the numeric test drop it on the floor.
+    if [[ "$mean" == -inf* ]]; then
+        val=silent
+    elif [[ "$mean" =~ '^-?[0-9]+(\.[0-9]+)?$' ]] && (( ${mean%.*} <= SILENCE_DB )); then
+        val=silent
+    fi
+    printf '%s\t%s\n' "$sz" "$val" > "$key"
+    [[ "$val" == silent ]]
+}
+
+typeset -i TOTAL_BYTES=0
+for d in "${MEETINGS[@]}"; do
+    if ! resolve "$d"; then
+        PROBLEMS+=("${d:t}: no recognisable artifacts at all")
+        continue
+    fi
+    for f in "$d"/**/*(.); do (( TOTAL_BYTES += $(bytes "$f") )); done
+
+    # One message, from the same predicate the destructive paths use — so the log
+    # always explains exactly why a meeting's video is being held back.
+    if (( ! M_TEXT_OK )); then
+        PROBLEMS+=("${d:t}: $M_TEXT_WHY — video will NOT be transcoded or deleted until this is fixed")
+    fi
+    if [[ -z "$M_VIDEO" && -z "$M_M4A" && -z "$M_TXT" ]]; then
+        PROBLEMS+=("${d:t}: no media and no transcript — empty meeting folder")
+    fi
+    # The known ScreenCaptureKit failure: a:2 recorded digital silence, so the
+    # other side of the conversation was never captured.
+    if [[ -n "$M_VIDEO" ]] && participants_silent "$d" "$M_VIDEO"; then
+        PROBLEMS+=("${d:t}: participants track is SILENT (system audio was not captured)")
+    fi
+done
+
+# Index staleness: whatever module 85 writes, it should be newer than the newest
+# meeting artifact. Look for it without hard-coding one module's private layout.
+INDEX_NOTE=""
+typeset -a idx
+idx=("$MEETING_ROOT"/.index* "$MEETING_ROOT"/_index* "$MEETING_TOOLS"/index/**/*(.N))
+if (( ${#idx} )); then
+    newest_idx=0
+    for f in "${idx[@]}"; do m=$(mtime "$f"); (( m > newest_idx )) && newest_idx=$m
+    done
+    newest_art=0
+    for d in "${MEETINGS[@]}"; do
+        for f in "$d"/*.txt "$d"/*_summary.md; do
+            m=$(mtime "$f"); (( m > newest_art )) && newest_art=$m
+        done
+    done
+    if (( newest_art > newest_idx )); then
+        INDEX_NOTE="search index is stale (newest meeting artifact is newer than the index)"
+        PROBLEMS+=("$INDEX_NOTE")
+    fi
+else
+    INDEX_NOTE="no search index found yet"
+fi
+
+log "health: ${#MEETINGS} meetings, $(human $TOTAL_BYTES) on disk, ${#PROBLEMS} problem(s)"
+[[ -n "$INDEX_NOTE" ]] && log "health: $INDEX_NOTE"
+if (( ${#PROBLEMS} )); then
+    for p in "${PROBLEMS[@]}"; do log "PROBLEM $p"; done
+    notify "⚠︎ Meeting health check" "${#PROBLEMS} problem(s) — see meeting-process.log"
+fi
+
+# ===========================================================================
+# PURPOSE 2 — WEEKLY DIGEST
+# ===========================================================================
+now=$(date +%s)
+last=0
+[[ -f "$LAST_DIGEST" ]] && last=$(cat "$LAST_DIGEST" 2>/dev/null || print 0)
+[[ "$last" == <-> ]] || last=0
+if (( now - last < DIGEST_EVERY_DAYS * 86400 )); then
+    exit 0   # not due yet — this is the fast no-op path on re-runs
+fi
+
+# --- gather the week's material --------------------------------------------
+cutoff=$(( now - 7 * 86400 ))
+brief=$(mktemp -t meeting-digest) || exit 1
+tmp_digest="$MEETING_ROOT/.weekly-digest.$$.md"
+# Both temps, not just the brief: a kill during `claude -p` would otherwise leave
+# a half-written .weekly-digest.<pid>.md sitting in the Meetings root.
+trap 'rm -f "$brief" "$tmp_digest"' EXIT INT TERM
+
+typeset -i TOTAL_SECS=0 N_RECENT=0
+{
+    print -r -- "# Raw material for the weekly digest"
+    print -r -- ""
+    print -r -- "## Meetings in the last 7 days"
+} > "$brief"
+
+for d in "${MEETINGS[@]}"; do
+    resolve "$d" || continue
+    [[ -n "$M_TXT" ]] || continue
+    ts=$(mtime "$M_TXT")
+    (( ts >= cutoff )) || continue
+    (( N_RECENT++ ))
+
+    # Length from the last transcript timestamp: works even after the video is
+    # gone, and costs nothing.
+    lastline=$(grep -o '^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\]' "$M_TXT" | tail -1 | tr -d '[]')
+    secs=0
+    if [[ -n "$lastline" ]]; then
+        h=${lastline%%:*}; rest=${lastline#*:}; m=${rest%%:*}; s=${rest##*:}
+        secs=$(( 10#$h * 3600 + 10#$m * 60 + 10#$s ))
+    fi
+    (( TOTAL_SECS += secs ))
+
+    {
+        print -r -- ""
+        # /bin/date pinned: BSD's -r <epoch> vs GNU's -r <file> differ.
+        print -r -- "### ${d:t}  (~$(( secs / 60 )) min, $(/bin/date -r $ts '+%a %d %b'))"
+        [[ -n "$M_SUMMARY" ]] && cat "$M_SUMMARY"
+        # Questions aimed at the user, if module 30 has produced insights.
+        for j in "$d"/*_insights.json; do
+            print -r -- ""
+            print -r -- "#### Insights (${j:t})"
+            jq -r '
+              def arr(x): (x // empty) | if type=="array" then .[] else . end;
+              [ arr(.questions), arr(.open_questions), arr(.unanswered_questions) ]
+              | .[] | if type=="object" then
+                  "- Q: \(.question // .text // .q // "?")  (asked of: \(.directed_at // .target // .owner // "?"), answered: \(.answered // .resolved // "unknown"))"
+                else "- Q: \(.)" end
+            ' "$j" 2>/dev/null || print -r -- "(insights JSON unreadable)"
+        done
+    } >> "$brief"
+done
+
+if (( N_RECENT == 0 )); then
+    log "digest: no meetings in the last 7 days; skipping"
+    print -r -- "$now" > "$LAST_DIGEST"
+    exit 0
+fi
+
+{
+    print -r -- ""
+    print -r -- "## Totals"
+    print -r -- "- Meetings this week: $N_RECENT"
+    print -r -- "- Total time in meetings: $(( TOTAL_SECS / 3600 ))h $(( (TOTAL_SECS % 3600) / 60 ))m"
+    print -r -- ""
+    print -r -- "## Open action items owned by You (unticked)"
+} >> "$brief"
+
+# Module 20 keeps a rolling global file; open items are the unticked checkboxes
+# whose owner is You. Be liberal about the exact wording modules use.
+ACTIONS="$MEETING_ROOT/_action-items.md"
+if [[ -f "$ACTIONS" ]]; then
+    grep -n '^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\]' "$ACTIONS" 2>/dev/null \
+        | grep -Ei '\byou\b|\(you\)|@you|owner:[[:space:]]*you' >> "$brief" \
+        || print -r -- "(none found)" >> "$brief"
+else
+    print -r -- "(no _action-items.md yet)" >> "$brief"
+fi
+
+{
+    print -r -- ""
+    print -r -- "## Threads that went quiet"
+} >> "$brief"
+THREADS="$MEETING_ROOT/_threads.md"
+if [[ -f "$THREADS" ]]; then
+    cat "$THREADS" >> "$brief"
+else
+    print -r -- "(no _threads.md yet — infer quiet topics from the summaries above: topics discussed earlier in the week with no follow-up since)" >> "$brief"
+fi
+
+{
+    print -r -- ""
+    print -r -- "## Health"
+    if (( ${#PROBLEMS} )); then
+        for p in "${PROBLEMS[@]}"; do print -r -- "- $p"; done
+    else
+        print -r -- "- All meetings have complete artifacts."
+    fi
+    print -r -- "- Disk used by Meetings: $(human $TOTAL_BYTES)"
+} >> "$brief"
+
+# --- write it up ------------------------------------------------------------
+# claude can exit 0 having printed an error string, a refusal, or nothing useful
+# (not logged in, no network, rate limited). Only publish something that actually
+# looks like the briefing we asked for; otherwise keep last week's digest, do not
+# stamp last-digest, and let the next run try again.
+digest_is_sane() { # <file>
+    [[ -s "$1" ]] || return 1
+    (( $(bytes "$1") >= 200 )) || return 1
+    grep -q '^#' "$1" || return 1
+    return 0
+}
+
+if bound $CLAUDE_TIMEOUT claude -p "You are given raw material gathered from a week of recorded meetings: per-meeting summaries, extracted insights, open action items, thread state and pipeline health. Write a crisp Monday-morning briefing in Markdown for the person who recorded these meetings ('You').
+
+Structure it as:
+# Weekly digest — <week ending date>
+## The week in one paragraph
+## Meetings (bulleted: name, length, one line of what happened)
+## Your open action items  (the things You still owe someone — most urgent first; if none, say so)
+## Questions waiting on you  (questions asked of You that were never answered)
+## Threads that went quiet  (topics raised earlier with no follow-up)
+## Housekeeping  (total time in meetings, disk, any pipeline problems)
+
+Be direct and specific. Reference the meeting a point came from. Do not invent action items, questions or names that are not in the material. If a section has nothing in it, write a single short line saying so rather than padding. Answer in the dominant language of the material." \
+        < "$brief" > "$tmp_digest" 2>> "$MEETING_LOG" && digest_is_sane "$tmp_digest"; then
+    mv -f "$tmp_digest" "$DIGEST"
+    print -r -- "$now" > "$LAST_DIGEST"
+    log "weekly digest written: $DIGEST ($N_RECENT meetings, $(( TOTAL_SECS / 3600 ))h $(( (TOTAL_SECS % 3600) / 60 ))m)"
+    notify "Weekly meeting digest" "$N_RECENT meetings · $(( TOTAL_SECS / 3600 ))h $(( (TOTAL_SECS % 3600) / 60 ))m · digest ready"
+else
+    rm -f "$tmp_digest"
+    log "digest: claude failed or returned an unusable digest; previous digest kept, will retry next run"
+    exit 1
+fi
+
+exit 0

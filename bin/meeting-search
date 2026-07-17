@@ -1,0 +1,114 @@
+#!/bin/zsh
+# meeting-search — semantic search across every indexed meeting transcript.
+#
+#   meeting-search "journal resubmission" [-n 8] [--rerank]
+#
+# Reads the vector index built by the 85-index enrichment module
+# ($MEETING_TOOLS/index/). --rerank pipes the top ~20 candidates through
+# `claude -p` to answer the question in prose, citing meeting + timestamp.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+IDX="$MEETING_TOOLS/index"
+PY="$IDX/venv/bin/python"
+
+usage() {
+    print -r -- "usage: meeting-search \"<query>\" [-n N] [--rerank]"
+    exit "${1:-2}"
+}
+
+QUERY=""; N=5; RERANK=0
+while (( $# )); do
+    case "$1" in
+        -n|--top)  (( $# > 1 )) || { print -u2 "meeting-search: -n needs a number"; exit 2; }
+                   shift; N="$1" ;;
+        --rerank)  RERANK=1 ;;
+        -h|--help) usage 0 ;;
+        -*)        print -u2 "meeting-search: unknown flag $1"; usage ;;
+        *)         [[ -z "$QUERY" ]] && QUERY="$1" || QUERY="$QUERY $1" ;;
+    esac
+    shift
+done
+[[ -n "$QUERY" ]] || usage
+[[ "$N" == <-> ]] || { print -u2 "meeting-search: -n needs a number"; exit 2; }
+(( N >= 1 )) || { print -u2 "meeting-search: -n must be at least 1"; exit 2; }
+
+[[ -x "$PY" && -f "$IDX/vectors.npy" ]] || {
+    print -u2 "meeting-search: no index yet at $IDX — it is built by the 85-index"
+    print -u2 "module the next time meeting-process runs over your meetings."
+    exit 1
+}
+
+# The model is already cached by 85-index, so stay fully offline: no hub calls,
+# no rate-limit warnings, no latency on every query.
+export HF_HOME="$IDX/hf" TOKENIZERS_PARALLELISM=false \
+       HF_HUB_DISABLE_PROGRESS_BARS=1 HF_HUB_OFFLINE=1
+
+# How many hits to gather: --rerank wants a wide candidate pool for Claude.
+CAND=$N
+(( RERANK )) && CAND=$(( N > 20 ? N : 20 ))
+
+hits=$("$PY" - "$QUERY" "$CAND" "$IDX" "$RERANK" <<'PYEOF'
+import json, os, sys
+import numpy as np
+
+query, cand, idx, rerank = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
+vecs = np.load(os.path.join(idx, "vectors.npy"))
+with open(os.path.join(idx, "meta.json"), encoding="utf-8") as fh:
+    meta = json.load(fh)
+
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2",
+                            cache_folder=os.path.join(idx, "models"))
+q = model.encode([query], normalize_embeddings=True).astype("float32")[0]
+
+scores = vecs @ q                       # vectors are L2-normalised -> cosine
+order = np.argsort(-scores)
+
+# One hit per (meeting, nearby timestamp): overlapping chunks otherwise return
+# the same moment several times.
+seen, hits = set(), []
+for i in order:
+    m = meta[int(i)]
+    key = (m["dir"], m["sec"] // 60)
+    if key in seen:
+        continue
+    seen.add(key)
+    hits.append((float(scores[int(i)]), m))
+    if len(hits) >= cand:
+        break
+
+for score, m in hits:
+    if rerank:
+        print(f"--- {m['meeting']}  [{m['ts']}]  (score {score:.2f})")
+        for line in m["context"]:
+            print(line)
+        print()
+    else:
+        print(f"\033[1m{m['meeting']}\033[0m  \033[36m[{m['ts']}]\033[0m  "
+              f"{m['speaker']}: {m['line']}   \033[2m({score:.2f})\033[0m")
+        for line in m["context"]:
+            if line.endswith(m["line"]):
+                continue
+            print(f"    \033[2m{line}\033[0m")
+        print()
+PYEOF
+) || { print -u2 "meeting-search: search failed"; exit 1; }
+
+if (( ! RERANK )); then
+    print -r -- "$hits"
+    exit 0
+fi
+
+print -u2 "meeting-search: reranking with claude…"
+print -r -- "QUESTION: $QUERY
+
+CANDIDATE PASSAGES (from transcripts of recorded meetings; 'You' is the person
+who recorded the meeting, 'Participants' is everyone else; timestamps are from
+the start of that recording):
+
+$hits" | claude -p "You are searching a personal archive of meeting transcripts. Below is a question followed by candidate transcript passages retrieved by semantic search (they are noisy auto-transcriptions and some are irrelevant). Answer the question in 2-5 sentences of plain prose, based ONLY on the passages. Cite the meeting folder name and timestamp for every claim, e.g. (2026-07-14_12-33_meeting [00:12:34]). If the passages do not actually answer the question, say so plainly instead of guessing. Then list the 1-3 most relevant passages as 'meeting [timestamp] — why it matters'."

@@ -1,0 +1,216 @@
+#!/bin/zsh
+# meeting-process — transcribe, summarize, and enrich finished OBS recordings.
+#
+# Spawned by OBS (see meeting-notify.lua): a launchd agent is blocked by macOS
+# privacy from reading ~/Documents, whereas a child of OBS inherits its access.
+#
+# Core pipeline (this file): discover finished recordings -> speaker-separated
+# transcript (whisper.cpp + Silero VAD) -> Claude summary.
+# Everything beyond that is a MODULE: an independent executable in
+# ~/.local/share/meeting-modules/ run in filename order against each meeting.
+# See meeting-modules/README.md for the contract.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+MEET_ROOT="$HOME/Recordings/Meetings"
+MODEL="$HOME/.local/share/whisper/ggml-large-v3-turbo.bin"
+VAD_MODEL="$HOME/.local/share/whisper/ggml-silero-v5.1.2.bin"
+MODULE_DIR="$HOME/.local/share/meeting-modules"
+TOOLS_DIR="$HOME/.local/share/meeting-tools"
+OBSIDIAN_VAULT="$HOME/Documents/Obsidian Vault"
+LOG="$HOME/Library/Logs/meeting-process.log"
+LOCK="$MEET_ROOT/.processing.lock"
+MIN_DURATION=60          # seconds; anything shorter is an accidental hotkey tap
+
+# VAD (voice-activity detection) skips silent stretches so Whisper does not
+# hallucinate filler ("Thank you.") on a track where nobody is speaking —
+# essential when mic and meeting audio are transcribed as separate tracks.
+VAD_ARGS=(--vad --vad-model "$VAD_MODEL")
+[[ -f "$VAD_MODEL" ]] || VAD_ARGS=()
+
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# Single-instance guard. Self-healing: the lock records its owner's PID, so a
+# lock left behind by a killed run is reclaimed rather than blocking forever.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    owner=$(cat "$LOCK/pid" 2>/dev/null)
+    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
+        exit 0
+    fi
+    log "reclaiming stale lock (owner ${owner:-unknown} is gone)"
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || exit 0
+fi
+print -r -- "$$" > "$LOCK/pid"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+[[ -f "$MODEL" ]] || { log "whisper model missing: $MODEL"; exit 1; }
+
+setopt null_glob
+
+# --- discovery -------------------------------------------------------------
+# A meeting is any subfolder carrying a `.meeting` marker, or (first time)
+# matching OBS's naming. The marker is what lets a module RENAME the folder to
+# something human-readable without the folder becoming undiscoverable.
+# Pre-existing ZoomMeeting_* folders match neither and are never touched.
+for d in "$MEET_ROOT"/*(/); do
+    [[ -f "$d/.meeting" || "${d:t}" == *_meeting ]] || continue
+
+    mkvs=("$d"/*.mkv)
+    (( ${#mkvs} )) || continue
+    f="${mkvs[1]}"
+    base="${f:t:r}"
+    txt="$d/$base.txt"
+    summary="$d/${base}_summary.md"
+
+    # Skip files OBS is still writing: size must be stable for 10 seconds
+    # (lsof is unreliable for detecting OBS's open recording files).
+    s1=$(/usr/bin/stat -f%z "$f")
+    sleep 10
+    s2=$(/usr/bin/stat -f%z "$f")
+    [[ "$s1" == "$s2" ]] || continue
+
+    # Ignore accidental hotkey taps. Without this, a 3-second blip gets a
+    # transcript, a Claude summary, an Obsidian note and a topic graph — junk
+    # that pollutes the vault and costs real API calls.
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
+    dur=${dur%%.*}
+    if [[ -n "$dur" ]] && (( dur < MIN_DURATION )); then
+        if [[ ! -f "$d/.too-short" ]]; then
+            log "skipping $base: only ${dur}s (< ${MIN_DURATION}s) — accidental recording"
+            : > "$d/.too-short"
+        fi
+        continue
+    fi
+
+    [[ -f "$d/.meeting" ]] || : > "$d/.meeting"
+
+    # --- transcription -----------------------------------------------------
+    if [[ ! -f "$txt" ]]; then
+        log "transcribing (speaker-separated): $base"
+        # Track layout: a:1 = Microphone ("You"), a:2 = Meeting audio
+        # ("Participants"), a:3 = redundant system-audio backup.
+        tmpd="$(mktemp -d -t meeting)"
+        n_tracks=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" | wc -l | tr -d ' ')
+
+        transcribe() { # <stream-index> <out-prefix>
+            local idx="$1" pref="$2" w="$tmpd/${2:t}.wav"
+            ffmpeg -y -loglevel error -i "$f" -map 0:a:$idx -vn -ac 1 -ar 16000 \
+                -c:a pcm_s16le "$w" 2>> "$LOG" || return 1
+            nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto -osrt \
+                -of "$pref" -np >> "$LOG" 2>&1
+        }
+
+        if [[ "$n_tracks" -ge 3 ]]; then
+            # Participants come from a:2. If that track is digital silence the
+            # capture source died mid-session — fall back to the backup track,
+            # and warn loudly, because a silent participant track means half the
+            # meeting is lost and nothing else would make that visible.
+            part_idx=2
+            mean=$(ffmpeg -i "$f" -map 0:a:2 -af volumedetect -f null - 2>&1 \
+                   | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p')
+            if [[ -n "$mean" ]] && (( ${mean%.*} <= -85 )); then
+                if [[ "$n_tracks" -ge 4 ]]; then
+                    bmean=$(ffmpeg -i "$f" -map 0:a:3 -af volumedetect -f null - 2>&1 \
+                            | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p')
+                    if [[ -n "$bmean" ]] && (( ${bmean%.*} > -85 )); then
+                        part_idx=3
+                        log "WARN $base: primary system audio silent; using backup track"
+                    fi
+                fi
+                if [[ $part_idx -eq 2 ]]; then
+                    log "WARN $base: NO SYSTEM AUDIO CAPTURED (participants missing)"
+                    /usr/bin/osascript -e 'display notification "System audio was not captured — participants are missing from this recording" with title "⚠︎ Meeting audio problem" sound name "Basso"' >/dev/null 2>&1
+                    # Persistent trace: a banner notification vanishes, but this
+                    # marker survives so the summary can disclose it and a later
+                    # review can tell this meeting is only one-sided.
+                    : > "$d/.audio-incomplete"
+                fi
+            fi
+            transcribe 1 "$tmpd/you" && transcribe "$part_idx" "$tmpd/participants"
+            if [[ $? -eq 0 ]]; then
+                python3 "$HOME/.local/share/obs-scripts/merge-tracks.py" \
+                    "$tmpd/you.srt" "$tmpd/participants.srt" "$txt" 2>> "$LOG"
+                [[ -f "$tmpd/participants.srt" ]] && cp "$tmpd/participants.srt" "$d/$base.srt"
+            fi
+        else
+            w="$tmpd/mix.wav"
+            if ffmpeg -y -loglevel error -i "$f" -map 0:a:0 -vn -ac 1 -ar 16000 \
+                    -c:a pcm_s16le "$w" 2>> "$LOG"; then
+                nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto -otxt -osrt \
+                    -of "$d/$base" -np >> "$LOG" 2>&1
+            fi
+        fi
+        rm -rf "$tmpd"
+
+        if [[ ! -s "$txt" ]]; then
+            log "whisper produced no transcript for $base (will retry next run)"
+            rm -f "$txt"; continue
+        fi
+        log "transcript done: $base.txt"
+    fi
+
+    # --- summary -----------------------------------------------------------
+    if [[ -f "$txt" && ! -f "$summary" && -s "$txt" ]]; then
+        log "summarizing: $base"
+        if claude -p "You are given a raw meeting transcript (auto-transcribed, may contain errors; language may be mixed). Lines are timestamped and labelled by speaker: 'You' is the person who recorded the meeting (microphone track); 'Participants' is everyone else (meeting audio track). Use these labels to attribute points and action items correctly. Write a meeting summary in Markdown with these sections: ## TL;DR (2-3 sentences), ## Key points, ## Decisions, ## Action items (attribute to You or a named participant when identifiable), ## Open questions. Keep it factual; do not invent names or details not in the transcript. Answer in the transcript's dominant language." \
+                < "$txt" > "$summary" 2>> "$LOG" && [[ -s "$summary" ]]; then
+            log "summary done: ${base}_summary.md"
+            # If participants were never captured, say so at the top of the
+            # summary — otherwise it reads as a faithful record of a two-sided
+            # conversation when it only reflects your microphone. Idempotent.
+            if [[ -f "$d/.audio-incomplete" ]] \
+               && ! grep -q 'participant audio was not captured' "$summary" 2>/dev/null; then
+                { print -r -- '> ⚠︎ **Incomplete recording — participant audio was not captured.**'
+                  print -r -- '> Only the microphone ("You") was recorded; everyone else is missing'
+                  print -r -- '> from the transcript, so this summary reflects only one side of the'
+                  print -r -- '> conversation. Likely cause: a Bluetooth output (e.g. AirPods) during'
+                  print -r -- '> the meeting — use built-in speakers to capture participants.'
+                  print -r -- ''
+                  cat "$summary"
+                } > "$summary.tmp" && mv "$summary.tmp" "$summary"
+            fi
+        else
+            rm -f "$summary"
+            log "claude summary failed for $base (will retry next run)"
+        fi
+    fi
+
+    # --- enrichment modules ------------------------------------------------
+    # Each module is independent and idempotent; a failing one must never break
+    # the others or the core artifacts, so failures are logged and skipped.
+    [[ -s "$txt" && -s "$summary" ]] || continue
+    for m in "$MODULE_DIR"/*(.x); do
+        MEETING_DIR="$d" MEETING_MKV="$f" MEETING_BASE="$base" \
+        MEETING_TXT="$txt" MEETING_SRT="$d/$base.srt" MEETING_SUMMARY="$summary" \
+        MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" \
+        OBSIDIAN_VAULT="$OBSIDIAN_VAULT" MEETING_LOG="$LOG" \
+            "$m" "$d" >> "$LOG" 2>&1 \
+            || log "module failed (continuing): ${m:t} on $base"
+        # A module may rename the folder (see 90-title). Follow the move AND
+        # recompute every derived path: leaving MEETING_TXT/SUMMARY/MKV pointing
+        # at the old directory would hand the next module dead file paths.
+        if [[ ! -d "$d" ]]; then
+            newd=$(cat "$MEET_ROOT/.last-rename" 2>/dev/null)
+            if [[ -n "$newd" && -d "$newd" ]]; then
+                d="$newd"
+                f="$d/$base.mkv"
+                txt="$d/$base.txt"
+                summary="$d/${base}_summary.md"
+            else
+                log "meeting folder vanished and no .last-rename to follow: $base"
+                continue
+            fi
+        fi
+    done
+done
+
+# --- global maintenance (runs once per invocation, not per meeting) ---------
+if [[ -x "$HOME/.local/bin/meeting-maintenance" ]]; then
+    MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" MEETING_LOG="$LOG" \
+        "$HOME/.local/bin/meeting-maintenance" >> "$LOG" 2>&1 \
+        || log "meeting-maintenance failed"
+fi
+
+exit 0

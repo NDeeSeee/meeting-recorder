@@ -1,0 +1,83 @@
+#!/bin/zsh
+# 99-mp4 — produce a double-clickable .mp4 next to the .mkv master.
+#
+# WHY BOTH FORMATS: MKV is written incrementally, so a crash or power loss during
+# recording still leaves a playable file — MP4 writes its index at the end, so a
+# crashed MP4 recording is unrecoverable. OBS crashed repeatedly on this machine,
+# so MKV is the right CAPTURE format. But crash-safety only matters *while
+# recording*; once the file is closed, MP4 is the better ARCHIVE format because
+# QuickTime/Finder can open it. So: capture MKV, then remux to MP4.
+#
+# Remux = stream copy. No re-encode, no quality loss, seconds not minutes.
+#
+# Runs LAST (99) on purpose: 50-speakers and 40-slides read the .mkv, so the
+# conversion must not happen until every module that needs it has run.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+DIR="${1:-$MEETING_DIR}"
+BASE="${MEETING_BASE:?}"
+MKV="${MEETING_MKV:?}"
+MP4="$DIR/$BASE.mp4"
+
+[[ -f "$MP4" ]] && exit 0            # idempotent: cheap check first
+[[ -f "$MKV" ]] || exit 0            # nothing to convert
+
+log() { print -r -- "mp4: $*"; }
+
+# Fingerprint the master so we can prove the copy is faithful. The audio track
+# TITLES matter as much as the codecs: track 2 is the mic ("You") and track 3 is
+# the system audio ("Participants"). A remux that silently drops those labels
+# would break speaker separation on any future re-run.
+fingerprint() {
+    ffprobe -v error -show_entries stream=codec_type,codec_name:stream_tags=title \
+            -of compact=p=0 "$1" 2>/dev/null
+}
+duration() {
+    ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null
+}
+
+src_fp=$(fingerprint "$MKV")
+src_dur=$(duration "$MKV")
+[[ -n "$src_dur" ]] || { log "cannot read source duration; skipping"; exit 0; }
+
+# The temp name must still end in .mp4: ffmpeg picks the muxer from the
+# extension, and cannot guess one from a bare ".tmp".
+tmp="$DIR/.$BASE.partial.mp4"
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+# -movflags +faststart puts the index up front so it streams/opens instantly.
+# Copy every stream and keep chapters (10-chapters may have embedded them).
+if ! timeout 3600 ffmpeg -y -v error -f matroska -i "$MKV" \
+        -map 0 -c copy -f mp4 -movflags +faststart "$tmp" 2>/dev/null; then
+    log "remux failed; keeping mkv only"
+    exit 0                            # fail soft — the master is untouched
+fi
+
+# --- verify BEFORE publishing ----------------------------------------------
+dst_dur=$(duration "$tmp")
+dst_fp=$(fingerprint "$tmp")
+
+if [[ -z "$dst_dur" ]]; then
+    log "output unreadable; discarding"; exit 0
+fi
+# Durations must match within a second.
+if ! awk -v a="$src_dur" -v b="$dst_dur" 'BEGIN{d=a-b; if(d<0)d=-d; exit !(d<=1.0)}'; then
+    log "duration mismatch ($src_dur vs $dst_dur); discarding mp4, keeping mkv"
+    exit 0
+fi
+if [[ "$src_fp" != "$dst_fp" ]]; then
+    log "stream/track-title mismatch; discarding mp4, keeping mkv"
+    log "  src: $src_fp"
+    log "  dst: $dst_fp"
+    exit 0
+fi
+if [[ ! -s "$tmp" ]]; then
+    log "empty output; discarding"; exit 0
+fi
+
+mv "$tmp" "$MP4" || { log "publish failed"; exit 0; }
+trap - EXIT INT TERM
+log "wrote $BASE.mp4 (verified: same duration, same streams, same track titles)"
+exit 0

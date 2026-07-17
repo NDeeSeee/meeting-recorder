@@ -1,0 +1,166 @@
+#!/bin/zsh
+# 95-route — file each meeting into the projects/people/threads it belongs to.
+#
+# The library (MEETING_ROOT) is the single source of truth: every recording is
+# stored exactly once. Everything else is a SYMLINK view onto it, which is the
+# whole point — a meeting about DPEP1B *and* the CRC atlas belongs to two
+# projects, and a physical folder cannot express that.
+#
+# Views created inside the library:
+#   _by-project/<Project>/<meeting> -> ../../<meeting>
+#   _by-person/<Person>/<meeting>   -> ../../<meeting>
+#   _by-thread/<Thread>/<meeting>   -> ../../<meeting>
+# And, for a matched project that is a git repo, a link back into the repo so
+# the meeting shows up where the work happens (that path is gitignored).
+#
+# "Active project" is not a list the user maintains — it is discovered from git
+# commit recency, which is what the phrase actually means in practice.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+DIR="${1:-$MEETING_DIR}"
+BASE="${MEETING_BASE:?}"
+ROOT="${MEETING_ROOT:?}"
+TOOLS="${MEETING_TOOLS:?}"
+SUMMARY="${MEETING_SUMMARY:?}"
+
+MARKER="$DIR/.routed"
+OUT="$DIR/${BASE}_routing.json"
+REPO_HOME="$HOME/Developer/GitHub"
+CACHE="$TOOLS/route"
+PROJECTS="$CACHE/projects.json"
+ACTIVE_DAYS=120          # a repo touched within this window counts as active
+
+[[ -f "$MARKER" && -f "$OUT" ]] && exit 0   # idempotent: cheap check first
+mkdir -p "$CACHE"
+
+log() { print -r -- "route: $*"; }
+
+# --- 1. discover candidate projects from git activity -----------------------
+# Refresh at most once a day; this is I/O over every repo.
+if [[ ! -f "$PROJECTS" ]] || [[ -n "$(find "$PROJECTS" -mtime +1 2>/dev/null)" ]]; then
+    now=$(date +%s)
+    {
+        print -r -- "["
+        first=1
+        for r in "$REPO_HOME"/*(/N); do
+            [[ -d "$r/.git" ]] || continue
+            ct=$(git -C "$r" log -1 --format=%ct 2>/dev/null) || continue
+            [[ -n "$ct" ]] || continue
+            days=$(( (now - ct) / 86400 ))
+            (( days <= ACTIVE_DAYS )) || continue
+            name="${r:t}"
+            # A one-line description helps the classifier far more than the name.
+            desc=$(head -40 "$r/README.md" 2>/dev/null \
+                   | sed -n 's/^# *//p;s/^## *//p' | head -1 | tr -d '"' | cut -c1-160)
+            [[ -z "$desc" ]] && desc="$name"
+            (( first )) || print -r -- ","
+            first=0
+            printf '{"name":"%s","path":"%s","days_since_commit":%d,"desc":"%s"}' \
+                   "$name" "$r" "$days" "$desc"
+        done
+        print -r -- "]"
+    } > "$PROJECTS.tmp" && mv "$PROJECTS.tmp" "$PROJECTS"
+fi
+
+cand=$(jq -c '.' "$PROJECTS" 2>/dev/null) || cand="[]"
+[[ "$cand" == "[]" ]] && { log "no active projects discovered"; }
+
+# --- 2. gather what we know about this meeting ------------------------------
+tldr=$(sed -n '/## TL;DR/,/^## /p' "$SUMMARY" 2>/dev/null | sed '1d;$d' | head -20)
+[[ -z "$tldr" ]] && tldr=$(head -25 "$SUMMARY")
+
+people_known=""
+if [[ -f "$DIR/${BASE}_calendar.json" ]]; then
+    people_known=$(jq -r '(.attendees // [])[] | (.name // .email // empty)' \
+                   "$DIR/${BASE}_calendar.json" 2>/dev/null | paste -sd, -)
+fi
+if [[ -z "$people_known" && -f "$DIR/${BASE}_speakers.json" ]]; then
+    people_known=$(jq -r '[.. | .speaker? // empty] | unique[]' \
+                   "$DIR/${BASE}_speakers.json" 2>/dev/null \
+                   | grep -viE '^speaker [0-9]+$' | paste -sd, -)
+fi
+
+topics=""
+[[ -f "$DIR/${BASE}_insights.json" ]] && \
+    topics=$(jq -r '[(.jargon // [])[] | (.term // .name // empty)] | join(", ")' \
+             "$DIR/${BASE}_insights.json" 2>/dev/null | cut -c1-400)
+
+thread=""
+[[ -f "$DIR/${BASE}_thread.md" ]] && \
+    thread=$(sed -n 's/^[Tt]hread: *//p;s/^\*\*Thread:\*\* *//p' "$DIR/${BASE}_thread.md" | head -1)
+
+# --- 3. classify ------------------------------------------------------------
+prompt="You route a recorded meeting to the software/research projects it concerns.
+
+CANDIDATE PROJECTS (JSON; days_since_commit shows how active each is):
+$cand
+
+MEETING SUMMARY (TL;DR):
+$tldr
+
+DOMAIN TERMS DISCUSSED: ${topics:-none}
+KNOWN ATTENDEES: ${people_known:-unknown}
+
+Return ONLY a JSON object, no prose, no code fence:
+{\"projects\":[\"<exact candidate name>\", ...],
+ \"people\":[\"<person full name>\", ...],
+ \"thread\":\"<short topic thread name>\",
+ \"confidence\":\"high|medium|low\",
+ \"why\":\"<one sentence>\"}
+
+Rules: only use project names that appear EXACTLY in the candidate list. A meeting
+may match several projects, or none — an empty list is correct and expected for an
+unrelated meeting; never guess to fill the list. Only list people actually named."
+
+raw=$(print -r -- "$prompt" | claude -p 2>/dev/null)
+json=$(print -r -- "$raw" | sed -n '/{/,/}/p' | tr -d '\000')
+if ! print -r -- "$json" | jq -e . >/dev/null 2>&1; then
+    log "classifier returned non-JSON; leaving meeting unrouted (will retry next run)"
+    exit 0                                  # fail soft: no marker, so we retry
+fi
+
+# Never trust the model with a path: keep only names that really are candidates.
+valid=$(jq -c --argjson c "$cand" \
+    '.projects |= (. // [] | map(select(. as $p | ($c | map(.name) | index($p)))))' \
+    <<< "$json" 2>/dev/null) || valid="$json"
+
+print -r -- "$valid" | jq '.' > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+
+# --- 4. build the symlink views --------------------------------------------
+# Relative targets keep the library relocatable.
+link_view() {  # <view> <bucket>
+    local view="$1" bucket="$2"
+    [[ -n "$bucket" ]] || return 0
+    bucket="${bucket//\//-}"                 # a slash would forge a new path
+    local d="$ROOT/$view/$bucket"
+    mkdir -p "$d" || return 0
+    local l="$d/${DIR:t}"
+    [[ -L "$l" || -e "$l" ]] && return 0
+    ln -s "../../${DIR:t}" "$l" 2>/dev/null && log "linked $view/$bucket/${DIR:t}"
+}
+
+jq -r '.projects[]?' "$OUT" 2>/dev/null | while read -r p; do link_view "_by-project" "$p"; done
+jq -r '.people[]?'   "$OUT" 2>/dev/null | while read -r p; do link_view "_by-person"  "$p"; done
+t=$(jq -r '.thread // empty' "$OUT" 2>/dev/null); [[ -n "$t" ]] && link_view "_by-thread" "$t"
+
+# --- 5. link back into the matching repo ------------------------------------
+# The meeting shows up where the work happens. docs/Meetings is already
+# gitignored, so a symlink there never enters git — verified before linking.
+jq -r '.projects[]?' "$OUT" 2>/dev/null | while read -r p; do
+    rp=$(jq -r --arg n "$p" '.[] | select(.name==$n) | .path' "$PROJECTS" 2>/dev/null)
+    [[ -n "$rp" && -d "$rp" ]] || continue
+    dest="$rp/docs/Meetings"
+    [[ -d "$dest" ]] || continue             # only where the convention exists
+    if ! git -C "$rp" check-ignore -q "$dest/${DIR:t}" 2>/dev/null; then
+        log "SKIP repo link for $p: $dest is not gitignored (refusing to put a meeting into git)"
+        continue
+    fi
+    l="$dest/${DIR:t}"
+    [[ -L "$l" || -e "$l" ]] && continue
+    ln -s "$DIR" "$l" 2>/dev/null && log "linked into repo $p"
+done
+
+: > "$MARKER"
+exit 0

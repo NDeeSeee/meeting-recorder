@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""20-actions — extract action items from a meeting and roll them up globally.
+
+Contract: see ~/.local/share/meeting-modules/README.md
+
+Outputs:
+  <MEETING_DIR>/<base>_actions.json   per-meeting action items
+  <MEETING_ROOT>/_action-items.md     global rolling checklist, newest meeting first
+  macOS Reminders                     items owned by "You" (list: "Meetings")
+
+Idempotent: if the per-meeting JSON exists and the meeting already has a section
+in the global file, exits 0 without doing any work (no LLM call).
+
+Test/override env vars (not used by the pipeline):
+  MEETING_REMINDERS_LIST    name of the Reminders list (default "Meetings")
+  MEETING_REMINDERS_DISABLE if set to 1, skip the Reminders push entirely
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import unicodedata
+from datetime import date
+from difflib import SequenceMatcher
+from pathlib import Path
+
+GLOBAL_NAME = "_action-items.md"
+CLAUDE_TIMEOUT = 600
+OSASCRIPT_TIMEOUT = 60
+
+
+def log(msg: str) -> None:
+    print(f"[20-actions] {msg}", flush=True)
+
+
+def find_claude() -> str:
+    """The pipeline runs with PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin,
+    which does NOT include ~/.local/bin where the Claude CLI actually lives."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    for cand in (
+        Path.home() / ".local/bin/claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ):
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    raise RuntimeError("the `claude` CLI could not be found on PATH or in ~/.local/bin")
+
+
+# --------------------------------------------------------------------------
+# environment
+# --------------------------------------------------------------------------
+
+def resolve_env(argv):
+    meeting_dir = Path(argv[1] if len(argv) > 1 else os.environ.get("MEETING_DIR", "")).expanduser()
+    if not meeting_dir.is_dir():
+        log(f"ERROR: meeting dir not found: {meeting_dir}")
+        sys.exit(1)
+
+    base = os.environ.get("MEETING_BASE") or meeting_dir.name
+    root = Path(os.environ.get("MEETING_ROOT") or meeting_dir.parent)
+    tools = Path(
+        os.environ.get("MEETING_TOOLS")
+        or (Path.home() / ".local/share/meeting-tools")
+    )
+
+    txt = Path(os.environ.get("MEETING_TXT") or (meeting_dir / f"{base}.txt"))
+    summary = Path(os.environ.get("MEETING_SUMMARY") or (meeting_dir / f"{base}_summary.md"))
+
+    return {
+        "dir": meeting_dir,
+        "base": base,
+        "root": root,
+        "tools": tools,
+        "txt": txt,
+        "summary": summary,
+        "json_out": meeting_dir / f"{base}_actions.json",
+        "global_md": root / GLOBAL_NAME,
+        "ledger": tools / "actions" / "pushed.json",
+    }
+
+
+# --------------------------------------------------------------------------
+# extraction via claude -p
+# --------------------------------------------------------------------------
+
+PROMPT = """You extract action items from a meeting.
+
+You are given the meeting SUMMARY followed by the full speaker-labelled TRANSCRIPT.
+"You" is the person who recorded the meeting. "Participants" is everyone else; use
+the transcript to work out an individual's real name where it is stated (e.g. Eric,
+Bob), otherwise use "Participants".
+
+Return ONLY a JSON array, no prose, no markdown fence. Each element:
+  {"owner": "You" or "<name>", "task": "<imperative, specific>", "due": "<YYYY-MM-DD or empty string>", "quote": "<one supporting transcript or summary line>"}
+
+Rules:
+- ONLY real commitments: something a specific person agreed or was asked to do.
+- EXCLUDE vague musings, hypotheticals, open questions, opinions, and things that
+  were already completed during the meeting.
+- If no due date was stated, use "". Never invent one. Resolve relative dates
+  ("next week", "by Friday") against the meeting date {meeting_date} when the
+  transcript makes the intent unambiguous.
+- "task" must stand alone out of context (no pronouns like "it"/"that").
+- Prefer few, high-confidence items over many speculative ones.
+- If there are no real action items, return [].
+"""
+
+
+def extract_json_array(raw: str):
+    """Pull a JSON array out of the model's stdout, tolerating fences/preamble."""
+    text = raw.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        text = fence.group(1).strip()
+
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("no JSON array found in model output")
+
+    return json.loads(text[start : end + 1])
+
+
+def one_line(text: str) -> str:
+    """A markdown checkbox and a '### owner' heading are single-line constructs.
+
+    A task carrying an embedded newline would split into a checkbox line plus an orphan
+    line of prose; the orphan is silently dropped on the next parse, and the truncated
+    checkbox then no longer matches the item it came from, so a completed item can lose
+    its tick. Collapse to one line at the boundary instead.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clean_items(data, strict: bool = False):
+    """Validate/normalise the model output into our schema.
+
+    `strict` is for LLM output (as opposed to re-reading our own JSON). It rejects a
+    response that is shaped like an array but whose entries ignore the schema.
+    """
+    items = []
+    if not isinstance(data, list):
+        if strict:
+            raise ValueError("model output was not a JSON array")
+        return items
+
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        # Type-check rather than str(): str() would happily turn {"task": 123} into the
+        # task "123" and {"task": null} into "None" -- fabricated work items.
+        raw_task = entry.get("task")
+        if not isinstance(raw_task, str):
+            continue
+        task = one_line(raw_task)
+        if not task:
+            continue
+
+        raw_owner = entry.get("owner")
+        owner = one_line(raw_owner) if isinstance(raw_owner, str) else ""
+        owner = owner or "Participants"
+
+        raw_due = entry.get("due")
+        due = raw_due.strip() if isinstance(raw_due, str) else ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", due):
+            due = ""  # never pass through an invented / malformed date
+
+        raw_quote = entry.get("quote")
+        quote = one_line(raw_quote) if isinstance(raw_quote, str) else ""
+
+        items.append({"owner": owner, "task": task, "due": due, "quote": quote})
+
+    # A NON-EMPTY array from which nothing validates means the model ignored the schema
+    # (wrong keys, wrong types, prose objects) -- it does NOT mean "this meeting had no
+    # action items". Accepting it as [] would write a complete-looking empty output, and
+    # because this module is idempotent that output is NEVER revisited: the meeting's
+    # action items would be lost permanently. Fail instead, so the next run retries.
+    if strict and data and not items:
+        raise ValueError(
+            f"model returned {len(data)} entr(ies), none matching the schema "
+            f"(first: {json.dumps(data[0], ensure_ascii=False)[:160]})"
+        )
+    return items
+
+
+def meeting_date_of(base: str) -> str:
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", base)
+    return m.group(1) if m else date.today().isoformat()
+
+
+def run_claude(env) -> list:
+    summary = env["summary"].read_text(encoding="utf-8", errors="replace")
+    transcript = env["txt"].read_text(encoding="utf-8", errors="replace")
+
+    stdin = f"=== SUMMARY ===\n{summary}\n\n=== TRANSCRIPT ===\n{transcript}\n"
+    prompt = PROMPT.replace("{meeting_date}", meeting_date_of(env["base"]))
+
+    claude = find_claude()
+    log(f"calling {claude} -p to extract action items (this can take a while)...")
+    proc = subprocess.run(
+        [claude, "-p", prompt],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=CLAUDE_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude -p failed (exit {proc.returncode}): {proc.stderr.strip()[:400]}")
+
+    return clean_items(extract_json_array(proc.stdout), strict=True)
+
+
+# --------------------------------------------------------------------------
+# global rolling markdown
+# --------------------------------------------------------------------------
+
+HEADER = "# Action items\n\n*Rolling list across all meetings, newest first. Tick a box and it stays ticked.*\n"
+
+BOX_RE = re.compile(r"^\s*-\s*\[([ xX])\]\s*(.+?)\s*$")
+OWNER_HEAD_RE = re.compile(r"^###\s+(.+?)\s*$")
+DUE_SUFFIX_RE = re.compile(r"\s*\(due:\s*[^)]*\)\s*$")
+OWNER_PREFIX_RE = re.compile(r"^\*\*[^*]+:\*\*\s*")
+
+# The extractor is an LLM: re-running it reworders/rewords the same commitment
+# ("...to use as the final CIBERSORT input" vs "...for the final CIBERSORT input").
+# Exact string matching therefore un-ticks completed items on regeneration, which is
+# the one thing this module must never do. Match fuzzily, and (see render_section)
+# carry over any ticked item that matches nothing rather than dropping it.
+SIM_THRESHOLD = 0.85
+
+# Second matcher, for the case the ratio above misses: the user hand-edits a line while
+# ticking it ("Upload raw counts matrix to the shared GDrive folder  <- did this monday")
+# and the LLM independently rewords the same commitment ("Upload the raw counts matrix to
+# the shared Google Drive folder"). Those two drift below SIM_THRESHOLD, the carry-over in
+# render_section then re-emits the user's ticked line AND the extractor's line as a fresh
+# UNTICKED box -- completed work reappearing as an open todo. Compare content words and
+# treat the shorter task being largely contained in the longer one as the same commitment.
+STOPWORDS = frozenset(
+    "a an and at be by for from in into is it of on or that the this to with".split()
+)
+OVERLAP_THRESHOLD = 0.75
+MIN_SHARED_TOKENS = 3
+
+
+def norm_task(text: str) -> str:
+    """Key used to match a task across regenerations (and against ticked boxes)."""
+    text = unicodedata.normalize("NFKC", text)
+    text = DUE_SUFFIX_RE.sub("", text)
+    text = OWNER_PREFIX_RE.sub("", text)
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def content_tokens(key: str) -> frozenset:
+    return frozenset(w for w in key.split() if w not in STOPWORDS)
+
+
+def same_commitment(key: str, other: str) -> bool:
+    """Are two normalised task keys the same underlying commitment?"""
+    if key == other:
+        return True
+    if SequenceMatcher(None, key, other).ratio() >= SIM_THRESHOLD:
+        return True
+    a, b = content_tokens(key), content_tokens(other)
+    if len(a) < MIN_SHARED_TOKENS or len(b) < MIN_SHARED_TOKENS:
+        return False  # too short to judge by overlap without false positives
+    shared = a & b
+    return (
+        len(shared) >= MIN_SHARED_TOKENS
+        and len(shared) / min(len(a), len(b)) >= OVERLAP_THRESHOLD
+    )
+
+
+def similar_to_any(task: str, keys) -> bool:
+    """True if `task` is the same commitment as something in `keys` (normalised)."""
+    key = norm_task(task)
+    return any(same_commitment(key, other) for other in keys)
+
+
+def parse_section_items(section: str):
+    """-> [(owner, checked, task_text)] for one meeting's existing section."""
+    out, owner = [], "Participants"
+    for line in section.splitlines():
+        head = OWNER_HEAD_RE.match(line)
+        if head:
+            owner = head.group(1)
+            continue
+        box = BOX_RE.match(line)
+        if box:
+            out.append((owner, box.group(1).lower() == "x", box.group(2).strip()))
+    return out
+
+
+def parse_global(path: Path):
+    """-> (preamble, {meeting_base: section_text}) from the existing file.
+
+    `preamble` is everything above the first "## " meeting section. This file is meant
+    to be hand-edited (that is the whole point of the checkboxes), so users add their own
+    notes and manual items at the top -- regenerating a canned header would delete them.
+    """
+    sections = {}
+    if not path.exists():
+        return HEADER, sections
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    # split into "## ..." meeting sections; anything before the first one is the preamble
+    parts = re.split(r"^(##\s+.*)$", text, flags=re.M)
+    preamble = parts[0].strip("\n")
+    preamble = (preamble + "\n") if preamble.strip() else HEADER
+
+    for i in range(1, len(parts), 2):
+        heading, body = parts[i], parts[i + 1]
+        link = re.search(r"\[([^\]]+)\]", heading)
+        key = (link.group(1) if link else heading.lstrip("# ").strip()).strip()
+        sections[key] = (heading.rstrip() + "\n" + body).rstrip() + "\n"
+
+    return preamble, sections
+
+
+def ticked_keys_of(section: str) -> set:
+    """Completed-task keys within ONE meeting's section.
+
+    Deliberately NOT global across meetings: the same commitment recurs across standups,
+    and a tick in June's section must not pre-tick a fresh commitment made in July.
+    """
+    return {norm_task(t) for (_o, done, t) in parse_section_items(section) if done}
+
+
+def render_section(base: str, items: list, ticked: set, prev_section: str = "") -> str:
+    """Render this meeting's section, preserving every completed item.
+
+    An item is ticked if it fuzzy-matches a previously-ticked task. Any previously
+    ticked task that matches NO newly-extracted item is carried over verbatim under
+    its original owner -- a done item must never silently disappear or come back
+    unticked just because the LLM reworded (or dropped) it.
+    """
+    prev = parse_section_items(prev_section) if prev_section else []
+    prev_done = [(o, t) for (o, done, t) in prev if done]
+
+    rows = []  # (owner, checked, text)
+    claimed = set()  # prev_done indices already re-emitted; two items must not claim one
+    for item in items:
+        # If this item is a rewording of something the user already ticked, re-emit the
+        # USER'S line verbatim: their tick AND whatever note they typed onto it ("<- did
+        # this monday") survive, and the commitment does not also reappear as an open box.
+        key = norm_task(item["task"])
+        match = next(
+            (
+                idx
+                for idx, (_o, t) in enumerate(prev_done)
+                if idx not in claimed and same_commitment(key, norm_task(t))
+            ),
+            None,
+        )
+        if match is not None:
+            claimed.add(match)
+            rows.append((prev_done[match][0], True, prev_done[match][1]))
+            continue
+        due = f" (due: {item['due']})" if item["due"] else ""
+        rows.append((item["owner"], similar_to_any(item["task"], ticked), item["task"] + due))
+
+    # Ticked items the extractor dropped entirely are carried over verbatim: a done item
+    # must never silently disappear just because the LLM stopped mentioning it.
+    rows.extend((o, True, t) for idx, (o, t) in enumerate(prev_done) if idx not in claimed)
+
+    lines = [f"## [{base}]({base}/)", ""]
+    if not rows:
+        lines += ["*No action items.*", ""]
+        return "\n".join(lines)
+
+    # "You" first, then everyone else alphabetically
+    owners = sorted({r[0] for r in rows}, key=lambda o: (o != "You", o.lower()))
+    for owner in owners:
+        lines.append(f"### {owner}")
+        for _, checked, text in (r for r in rows if r[0] == owner):
+            lines.append(f"- [{'x' if checked else ' '}] {text}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def sort_key(base: str):
+    """Sorted with reverse=True this yields: dated meetings newest-first, then the rest.
+
+    Date-prefixed folder names (2026-07-14_12-33_...) sort correctly as plain strings.
+    """
+    dated = bool(re.match(r"\d{4}-\d{2}-\d{2}", base))
+    return (1 if dated else 0, base)
+
+
+def write_global(env, items):
+    path = env["global_md"]
+    preamble, sections = parse_global(path)
+    prev_section = sections.get(env["base"], "")
+    ticked = ticked_keys_of(prev_section)  # this meeting's own ticks only
+
+    sections[env["base"]] = render_section(env["base"], items, ticked, prev_section)
+
+    ordered = sorted(sections, key=sort_key, reverse=True)
+    body = preamble + "\n" + "\n".join(sections[k].rstrip() + "\n" for k in ordered)
+    body = re.sub(r"\n{3,}", "\n\n", body)  # sections are round-tripped; keep spacing tidy
+    atomic_write(path, body)
+
+    kept = sum(1 for i in items if similar_to_any(i["task"], ticked))
+    carried = sum(
+        1
+        for (_, done, t) in parse_section_items(prev_section)
+        if done and not similar_to_any(t, [norm_task(i["task"]) for i in items])
+    )
+    log(f"global: {path} ({len(sections)} meeting(s), {kept} ticked item(s) preserved, "
+        f"{carried} completed item(s) carried over)")
+
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())  # rename is atomic, but the bytes must be on disk first
+        os.replace(tmp, path)  # never leave a half-written file behind
+    except BaseException:
+        tmp.unlink(missing_ok=True)  # no stray .tmp.<pid> next to the user's task list
+        raise
+
+
+# --------------------------------------------------------------------------
+# macOS Reminders
+# --------------------------------------------------------------------------
+
+def as_quote(text: str) -> str:
+    """Escape a Python string for embedding in an AppleScript string literal."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_applescript(list_name: str, items: list, base: str) -> str:
+    lines = [
+        'tell application "Reminders"',
+        f'  if not (exists list "{as_quote(list_name)}") then',
+        f'    make new list with properties {{name:"{as_quote(list_name)}"}}',
+        "  end if",
+        f'  tell list "{as_quote(list_name)}"',
+    ]
+    for item in items:
+        name = as_quote(item["task"])
+        body = as_quote(f"From meeting: {base}" + (f"\n\n> {item['quote']}" if item["quote"] else ""))
+        props = f'{{name:"{name}", body:"{body}"}}'
+        if item["due"]:
+            y, mo, d = item["due"].split("-")
+            # Build the date arithmetically: `date "..."` parsing is locale-dependent.
+            # `set day to 1` FIRST: the day carries over from `current date`, so setting
+            # the month while day is 31 overflows (Jan 31 -> "Feb 31" -> Mar 3) and the
+            # reminder silently lands a month late. Pinning day=1 makes it total.
+            lines += [
+                "    set dueDate to (current date)",
+                "    set day of dueDate to 1",
+                f"    set year of dueDate to {int(y)}",
+                f"    set month of dueDate to {int(mo)}",
+                f"    set day of dueDate to {int(d)}",
+                "    set time of dueDate to 9 * hours",
+                f"    make new reminder with properties {{name:\"{name}\", body:\"{body}\", due date:dueDate}}",
+            ]
+        else:
+            lines.append(f"    make new reminder with properties {props}")
+    lines += ["  end tell", "end tell"]
+    return "\n".join(lines)
+
+
+def existing_reminder_names(list_name: str, base: str) -> list:
+    """Names already pushed FOR THIS MEETING (incl. completed). [] if inaccessible.
+
+    Scoped by the "From meeting: <base>" marker we write into every body. Matching on the
+    whole list instead would mean a recurring commitment ("send Bob the figure panel"),
+    already pushed from an earlier meeting, is never pushed again for the new one.
+    """
+    marker = as_quote(f"From meeting: {base}")
+    script = (
+        f'tell application "Reminders"\n'
+        f'  if not (exists list "{as_quote(list_name)}") then return ""\n'
+        f'  set out to ""\n'
+        f'  repeat with r in reminders of list "{as_quote(list_name)}"\n'
+        f"    set b to body of r\n"
+        f'    if b is not missing value and b contains "{marker}" then\n'
+        f"      set out to out & (name of r) & linefeed\n"
+        f"    end if\n"
+        f"  end repeat\n"
+        f"  return out\n"
+        f"end tell"
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-"], input=script, capture_output=True,
+            text=True, timeout=OSASCRIPT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def load_ledger(path: Path) -> dict:
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError) as exc:
+            log(f"warning: unreadable ledger {path} ({exc}); starting a new one")
+    return {}
+
+
+def push_reminders(env, items) -> None:
+    """Push "You" items to Reminders. Never fatal — log and continue on failure."""
+    if os.environ.get("MEETING_REMINDERS_DISABLE") == "1":
+        log("reminders: disabled via MEETING_REMINDERS_DISABLE=1")
+        return
+
+    list_name = os.environ.get("MEETING_REMINDERS_LIST") or "Meetings"
+    mine = [i for i in items if i["owner"] == "You"]
+    if not mine:
+        log("reminders: no items owned by You; nothing to push")
+        return
+
+    ledger = load_ledger(env["ledger"])
+    already = set(ledger.get(env["base"], []))
+
+    # Second line of defence: the ledger keys off task text, and the LLM rewords tasks
+    # between runs. Also ask Reminders what is actually in the list already.
+    already |= {norm_task(n) for n in existing_reminder_names(list_name, env["base"])}
+
+    todo = [i for i in mine if not similar_to_any(i["task"], already)]
+    if not todo:
+        log(f"reminders: all {len(mine)} item(s) already present; skipping")
+        return
+
+    script = build_applescript(list_name, todo, env["base"])
+    try:
+        proc = subprocess.run(
+            ["osascript", "-"],
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=OSASCRIPT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"reminders: unavailable ({exc}); continuing")
+        return
+
+    if proc.returncode != 0:
+        # Most likely cause: Automation permission not granted to the parent process.
+        log(f"reminders: FAILED, continuing anyway -> {proc.stderr.strip()[:300]}")
+        log("reminders: grant Automation access (System Settings > Privacy & Security > Automation)")
+        return
+
+    # only record what we actually pushed
+    ledger[env["base"]] = sorted(already | {norm_task(i["task"]) for i in todo})
+    atomic_write(env["ledger"], json.dumps(ledger, indent=2, ensure_ascii=False) + "\n")
+    log(f'reminders: added {len(todo)} item(s) to list "{list_name}"')
+
+
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    env = resolve_env(sys.argv)
+
+    # Rule 6: the idempotency check must be cheap and come first.
+    if env["json_out"].exists():
+        _, sections = parse_global(env["global_md"])
+        if env["base"] in sections:
+            log(f"already done ({env['json_out'].name}); nothing to do")
+            return 0
+        log("actions.json exists but the meeting is missing from the global file; re-merging only")
+        try:
+            items = clean_items(json.loads(env["json_out"].read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError) as exc:
+            log(f"warning: could not reuse {env['json_out']} ({exc}); re-extracting")
+            items = None
+        if items is not None:
+            write_global(env, items)
+            push_reminders(env, items)
+            return 0
+
+    for key in ("txt", "summary"):
+        if not env[key].is_file():
+            log(f"ERROR: required input missing: {env[key]}")
+            return 1
+
+    try:
+        items = run_claude(env)
+    except Exception as exc:  # extraction is the one genuinely fatal step
+        log(f"ERROR: extraction failed: {exc}")
+        return 1
+
+    atomic_write(env["json_out"], json.dumps(items, indent=2, ensure_ascii=False) + "\n")
+    log(f"wrote {env['json_out']} ({len(items)} item(s), "
+        f"{sum(1 for i in items if i['owner'] == 'You')} owned by You)")
+
+    write_global(env, items)
+    push_reminders(env, items)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

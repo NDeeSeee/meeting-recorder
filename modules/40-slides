@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""40-slides — extract distinct screen-share frames from a meeting recording.
+
+Outputs into <MEETING_DIR>/slides/:
+  frame_<HH-MM-SS>.jpg  one per visually distinct moment
+  contact-sheet.jpg     montage of all frames (ffmpeg tile filter)
+  slides.md             each frame + the transcript lines spoken around it
+
+Contract: ~/.local/share/meeting-modules/README.md
+Idempotent: exits 0 immediately if slides/slides.md already exists.
+Offline, stdlib-only, no venv needed (ffmpeg/ffprobe do all the heavy lifting).
+"""
+
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+# ---- tuning -----------------------------------------------------------------
+SCAN_FPS = 1  # sample 1 frame/sec; slides don't change faster than that
+SCAN_W = 640  # downscale before scene detection (fast, and ignores video noise)
+SCENE_TH = 0.15  # ffmpeg scene score cutoff for a *candidate*
+MIN_GAP = 12  # seconds; ignore a candidate this close to the previous keeper
+DHASH_DIST = 12  # <= this hamming distance (of 64) == "same slide", drop it
+MAX_FRAMES = 40  # hard cap; if exceeded, keep the highest-scoring ones
+MIN_DURATION = 120  # shorter meetings than this: nothing worth extracting
+OUT_W = 1600  # output frame width
+NARRATION_WINDOW = 20  # +/- seconds of transcript around each frame
+TILE_COLS = 4
+TILE_W, TILE_H = 480, 300  # contact-sheet cell size
+# -----------------------------------------------------------------------------
+
+
+# Files this module is allowed to destroy: anything it created itself.
+ARTIFACT_RE = re.compile(r"^(slides\.md|contact-sheet\.jpg|frame_\d{2}-\d{2}-\d{2}\.jpg)$")
+# Same, plus the scratch files that only ever exist inside our temp dir.
+TMP_CONTENT_RE = re.compile(
+    r"^(slides\.md|contact-sheet\.jpg|frame_\d{2}-\d{2}-\d{2}\.jpg|scores\.txt|sheet\.txt)$"
+)
+# tempfile.mkdtemp(prefix="slides.") -> "slides." + random chars. Don't pin the
+# suffix length (an implementation detail); owned_dir() is what gates deletion.
+TMP_NAME_RE = re.compile(r"^slides\.[A-Za-z0-9_]+$")
+
+
+def log(msg):
+    print(f"[40-slides] {msg}", flush=True)
+
+
+def owned_dir(path, rx):
+    """True only if `path` is a real dir whose every entry is a file we generate.
+
+    Anything else -- a symlink, a foreign file, a nested dir -- means the
+    directory is not ours and must not be deleted (contract rule 2).
+    """
+    if os.path.islink(path) or not os.path.isdir(path):
+        return False
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    return all(
+        rx.match(e) and os.path.isfile(os.path.join(path, e)) and not os.path.islink(os.path.join(path, e))
+        for e in entries
+    )
+
+
+def sweep_stale_temps(meeting_dir):
+    """Remove our own temp dirs orphaned by an earlier kill -9 / crash / reboot."""
+    try:
+        names = os.listdir(meeting_dir)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(meeting_dir, name)
+        if TMP_NAME_RE.match(name) and owned_dir(path, TMP_CONTENT_RE):
+            log(f"removing stale temp dir {name}")
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _terminate(signum, _frame):
+    """Turn SIGTERM/SIGINT into SystemExit so the `finally` cleanup still runs."""
+    raise SystemExit(128 + signum)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
+
+
+def hhmmss(seconds):
+    s = int(seconds)
+    return f"{s // 3600:02d}-{(s % 3600) // 60:02d}-{s % 60:02d}"
+
+
+def clock(seconds):
+    s = int(seconds)
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def probe(mkv):
+    """Return (has_video, duration_seconds)."""
+    r = run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_type",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            mkv,
+        ]
+    )
+    if r.returncode != 0:
+        return False, 0.0
+    has_video = False
+    duration = 0.0
+    for line in r.stdout.split():
+        if line == "video":
+            has_video = True
+        else:
+            try:
+                duration = float(line)
+            except ValueError:
+                pass
+    return has_video, duration
+
+
+def scene_candidates(mkv, tmp):
+    """One decode pass: (timestamp, scene_score) for every candidate frame."""
+    meta = os.path.join(tmp, "scores.txt")
+    vf = (
+        f"fps={SCAN_FPS},scale={SCAN_W}:-2,"
+        f"select='gt(scene,{SCENE_TH})',metadata=print:file={meta}"
+    )
+    r = run(["ffmpeg", "-v", "error", "-nostdin", "-i", mkv, "-an", "-sn",
+             "-vf", vf, "-f", "null", "-"])
+    if r.returncode != 0:
+        log(f"scene scan failed: {r.stderr.strip()[:300]}")
+        return []
+    if not os.path.exists(meta):
+        return []
+    with open(meta, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    pairs = re.findall(r"pts_time:([\d.]+)\s*\n\s*lavfi\.scene_score=([\d.]+)", text)
+    return [(float(t), float(s)) for t, s in pairs]
+
+
+def thin_by_gap(cands):
+    """Greedy: drop candidates within MIN_GAP of the previously kept one."""
+    kept, last = [], -1e9
+    for t, s in cands:
+        if t - last >= MIN_GAP:
+            kept.append((t, s))
+            last = t
+    return kept
+
+
+def extract(mkv, ts, path):
+    r = run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{ts:.2f}", "-i", mkv,
+             "-frames:v", "1", "-an", "-sn",
+             "-vf", f"scale={OUT_W}:-2:flags=lanczos", "-q:v", "3", "-y", path])
+    return r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0
+
+
+def dhash(path):
+    """64-bit difference hash via ffmpeg (9x8 grayscale raw)."""
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", path,
+         "-vf", "scale=9:8:flags=bilinear,format=gray", "-f", "rawvideo", "-"],
+        capture_output=True, check=False,
+    )
+    px = r.stdout
+    if len(px) < 72:
+        return None
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            left = px[row * 9 + col]
+            right = px[row * 9 + col + 1]
+            bits = (bits << 1) | (1 if left > right else 0)
+    return bits
+
+
+def load_transcript(txt_path):
+    """[(seconds, 'Speaker: text'), ...]"""
+    out = []
+    if not txt_path or not os.path.exists(txt_path):
+        return out
+    pat = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\]\s*(.+)$")
+    with open(txt_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = pat.match(line.strip())
+            if m:
+                h, mnt, s, rest = m.groups()
+                out.append((int(h) * 3600 + int(mnt) * 60 + int(s), rest))
+    return out
+
+
+def narration(lines, ts):
+    lo, hi = ts - NARRATION_WINDOW, ts + NARRATION_WINDOW
+    return [(t, txt) for t, txt in lines if lo <= t <= hi]
+
+
+def contact_sheet(frames, out_path, tmp):
+    n = len(frames)
+    cols = min(TILE_COLS, n)
+    rows = (n + cols - 1) // cols
+    listing = os.path.join(tmp, "sheet.txt")
+    with open(listing, "w", encoding="utf-8") as fh:
+        for f in frames:
+            fh.write("file '" + f.replace("'", "'\\''") + "'\n")
+            fh.write("duration 1\n")
+    vf = (
+        f"scale={TILE_W}:{TILE_H}:force_original_aspect_ratio=decrease,"
+        f"pad={TILE_W}:{TILE_H}:(ow-iw)/2:(oh-ih)/2:color=black,"
+        f"tile={cols}x{rows}:padding=6:margin=6:color=black"
+    )
+    r = run(["ffmpeg", "-v", "error", "-nostdin", "-f", "concat", "-safe", "0",
+             "-i", listing, "-vf", vf, "-frames:v", "1", "-q:v", "3", "-y", out_path])
+    if r.returncode != 0:
+        log(f"contact sheet failed: {r.stderr.strip()[:300]}")
+        return False
+    return os.path.exists(out_path)
+
+
+def main():
+    meeting_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MEETING_DIR", "")
+    if not meeting_dir or not os.path.isdir(meeting_dir):
+        log("no MEETING_DIR")
+        return 1
+
+    out_dir = os.path.join(meeting_dir, "slides")
+    slides_md = os.path.join(out_dir, "slides.md")
+    if os.path.exists(slides_md):  # rule 1 / rule 6: cheap idempotency check first
+        return 0
+
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            log(f"{tool} not on PATH")
+            return 1
+
+    # Refuse to clobber anything we did not create -- and find out *before*
+    # spending 30s decoding, not after (contract rule 2).
+    if os.path.lexists(out_dir) and not owned_dir(out_dir, ARTIFACT_RE):
+        log(f"{out_dir} exists and was not created by this module; refusing to replace it")
+        return 1
+
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
+    sweep_stale_temps(meeting_dir)
+
+    base = os.environ.get("MEETING_BASE") or os.path.basename(meeting_dir)
+    mkv = os.environ.get("MEETING_MKV") or os.path.join(meeting_dir, base + ".mkv")
+    txt = os.environ.get("MEETING_TXT") or os.path.join(meeting_dir, base + ".txt")
+
+    if not os.path.exists(mkv):
+        log("no recording; nothing to do")
+        return 0
+
+    has_video, duration = probe(mkv)
+    if not has_video:
+        log("no video track; nothing to do")
+        return 0
+    if duration < MIN_DURATION:
+        log(f"meeting is only {duration:.0f}s; nothing to do")
+        return 0
+
+    tmp = tempfile.mkdtemp(prefix="slides.", dir=meeting_dir)
+    try:
+        cands = scene_candidates(mkv, tmp)
+        log(f"{len(cands)} scene candidates above {SCENE_TH}")
+        cands = thin_by_gap(cands)
+
+        # Cap: keep the strongest scene changes, then restore time order.
+        if len(cands) > MAX_FRAMES:
+            cands = sorted(sorted(cands, key=lambda c: -c[1])[:MAX_FRAMES])
+        if not cands:
+            log("no distinct frames found; nothing to do")
+            return 0
+
+        kept, hashes = [], []
+        for ts, _score in cands:
+            path = os.path.join(tmp, f"frame_{hhmmss(ts)}.jpg")
+            if not extract(mkv, ts, path):
+                continue
+            h = dhash(path)
+            if h is not None:
+                if any(bin(h ^ prev).count("1") <= DHASH_DIST for prev in hashes):
+                    os.remove(path)  # near-identical to a frame we already have
+                    continue
+                hashes.append(h)
+            kept.append((ts, path))
+
+        if not kept:
+            log("all frames deduplicated away; nothing to do")
+            return 0
+        log(f"{len(kept)} distinct frames kept")
+
+        sheet = os.path.join(tmp, "contact-sheet.jpg")
+        have_sheet = contact_sheet([p for _, p in kept], sheet, tmp)
+
+        lines = load_transcript(txt)
+        md = [f"# Slides — {base}", "",
+              f"{len(kept)} distinct frames from a {int(duration // 60)} min recording. "
+              "Each timestamp is an offset into the video/transcript.", ""]
+        if have_sheet:
+            md += ["## Contact sheet", "", "![contact sheet](contact-sheet.jpg)", ""]
+        md += ["## Frames", ""]
+        for ts, path in kept:
+            name = os.path.basename(path)
+            md += [f"### {clock(ts)}", "", f"![{clock(ts)}]({name})", ""]
+            said = narration(lines, ts)
+            if said:
+                md.append(f"*Said around this moment (±{NARRATION_WINDOW}s):*")
+                md.append("")
+                for t, text in said:
+                    md.append(f"> `[{clock(t)}]` {text}")
+                md.append("")
+            else:
+                md += ["*(nothing said around this moment)*", ""]
+
+        with open(os.path.join(tmp, "slides.md"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(md).rstrip() + "\n")
+
+        # Publish atomically: everything lands, or nothing does (rule 3).
+        for scratch in ("sheet.txt", "scores.txt"):
+            try:
+                os.remove(os.path.join(tmp, scratch))
+            except FileNotFoundError:
+                pass
+        # mkdtemp gives 0700; the published dir should look like its siblings.
+        os.chmod(tmp, 0o755)
+        # Re-check under the same rule as above: only ever delete our own output.
+        if os.path.lexists(out_dir):
+            if not owned_dir(out_dir, ARTIFACT_RE):
+                log(f"{out_dir} appeared and is not ours; leaving it alone")
+                return 1
+            shutil.rmtree(out_dir)
+        os.rename(tmp, out_dir)
+        tmp = None
+        log(f"wrote {slides_md}")
+        return 0
+    finally:
+        if tmp and os.path.isdir(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

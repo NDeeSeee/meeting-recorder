@@ -1,0 +1,281 @@
+#!/bin/bash
+# 70-calendar — match this recording to a macOS Calendar event (EventKit).
+#
+# The recording's folder name only knows when it started. The calendar knows the
+# real title, the attendees, the organizer, the meeting URL and the agenda.
+# This module finds the calendar event that overlaps the recording window and
+# writes it to <MEETING_DIR>/<base>_calendar.json for downstream modules
+# (80-obsidian, 90-title) to consume.
+#
+# Output: <MEETING_DIR>/<base>_calendar.json
+#   matched:true  -> full event details
+#   matched:false -> no overlapping event (ad-hoc call). This is normal.
+#
+# If Calendar access has not been granted to the process running the pipeline,
+# we log exactly what to grant and exit 0 WITHOUT writing the output file, so a
+# later run (after the user grants access) still gets a chance to match.
+
+set -uo pipefail
+
+MEETING_DIR="${1:-${MEETING_DIR:-}}"
+[ -n "$MEETING_DIR" ] && [ -d "$MEETING_DIR" ] || { echo "70-calendar: usage: 70-calendar <MEETING_DIR>" >&2; exit 1; }
+
+MEETING_BASE="${MEETING_BASE:-$(basename "$MEETING_DIR")}"
+MEETING_MKV="${MEETING_MKV:-$MEETING_DIR/$MEETING_BASE.mkv}"
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+
+OUT="$MEETING_DIR/${MEETING_BASE}_calendar.json"
+
+# --- Rule 1/6: cheap idempotency check, before any work -----------------------
+if [ -s "$OUT" ]; then
+    echo "70-calendar: $(basename "$OUT") already exists — skipping"
+    exit 0
+fi
+
+log() { echo "70-calendar: $*"; }
+
+# --- Recording start time from the folder/base name ---------------------------
+# Expected: YYYY-MM-DD_HH-MM_meeting
+if [[ "$MEETING_BASE" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2}-[0-9]{2}) ]]; then
+    REC_DATE="${BASH_REMATCH[1]}"
+    REC_TIME="${BASH_REMATCH[2]}"
+else
+    log "cannot parse a start time out of MEETING_BASE='$MEETING_BASE' — nothing to match against"
+    exit 0
+fi
+
+# --- Recording duration from ffprobe -----------------------------------------
+DURATION=""
+if [ -e "$MEETING_MKV" ] && command -v ffprobe >/dev/null 2>&1; then
+    DURATION="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$MEETING_MKV" 2>/dev/null | head -n1)"
+fi
+case "$DURATION" in
+    ''|*[!0-9.]*) DURATION="" ;;
+esac
+if [ -z "$DURATION" ]; then
+    DURATION=3600
+    log "ffprobe gave no duration for '$MEETING_MKV' — assuming 3600s window"
+fi
+
+# --- Build the EventKit query binary once ------------------------------------
+TOOLDIR="$MEETING_TOOLS/calendar"
+BIN="$TOOLDIR/calquery"
+SRC="$TOOLDIR/calquery.swift"
+
+mkdir -p "$TOOLDIR" || { log "cannot create $TOOLDIR"; exit 1; }
+
+cat > "$SRC.new" <<'SWIFT_EOF'
+// calquery <YYYY-MM-DD> <HH-MM> <duration_seconds>
+// Finds the macOS Calendar event that best overlaps the recording window and
+// prints it as JSON on stdout. Exit 2 == Calendar access not granted.
+import Foundation
+import EventKit
+
+let a = CommandLine.arguments
+guard a.count >= 4, let dur = Double(a[3]) else {
+    FileHandle.standardError.write("usage: calquery <YYYY-MM-DD> <HH-MM> <duration_seconds>\n".data(using: .utf8)!)
+    exit(64)
+}
+
+let df = DateFormatter()
+df.locale = Locale(identifier: "en_US_POSIX")
+df.timeZone = TimeZone.current            // recording folder names are local time
+df.dateFormat = "yyyy-MM-dd HH-mm"
+guard let recStart = df.date(from: "\(a[1]) \(a[2])") else {
+    FileHandle.standardError.write("calquery: unparseable start '\(a[1]) \(a[2])'\n".data(using: .utf8)!)
+    exit(64)
+}
+let recEnd = recStart.addingTimeInterval(dur)
+
+let store = EKEventStore()
+
+func haveAccess() -> String? {   // nil == access OK, else a human-readable reason
+    let st = EKEventStore.authorizationStatus(for: .event)
+    if #available(macOS 14.0, *) {
+        if st == .fullAccess { return nil }
+        if st == .writeOnly { return "Calendar access is write-only (full access required to read events)" }
+    } else {
+        if st == .authorized { return nil }
+    }
+    if st == .denied { return "Calendar access was explicitly denied for this process" }
+    if st == .restricted { return "Calendar access is restricted by policy (MDM / parental controls)" }
+
+    // .notDetermined — ask. A non-GUI / background process usually gets refused
+    // outright or never answers; don't hang the pipeline on it.
+    var granted = false
+    let sem = DispatchSemaphore(value: 0)
+    if #available(macOS 14.0, *) {
+        store.requestFullAccessToEvents { ok, _ in granted = ok; sem.signal() }
+    } else {
+        store.requestAccess(to: .event) { ok, _ in granted = ok; sem.signal() }
+    }
+    if sem.wait(timeout: .now() + 20) == .timedOut {
+        return "Calendar access request timed out (no one can answer the prompt from a background process)"
+    }
+    if granted { return nil }
+    return "Calendar access request was refused (status was 'not determined'; a background/non-GUI process cannot raise the permission prompt)"
+}
+
+if let reason = haveAccess() {
+    FileHandle.standardError.write("\(reason)\n".data(using: .utf8)!)
+    exit(2)
+}
+
+let iso = ISO8601DateFormatter()
+iso.formatOptions = [.withInternetDateTime]
+iso.timeZone = TimeZone.current
+
+func email(_ p: EKParticipant?) -> String? {
+    guard let u = p?.url else { return nil }
+    let s = u.absoluteString
+    return s.hasPrefix("mailto:") ? String(s.dropFirst(7)) : s
+}
+func person(_ p: EKParticipant?) -> [String: Any]? {
+    guard let p = p else { return nil }
+    var d: [String: Any] = [:]
+    if let n = p.name, !n.isEmpty { d["name"] = n }
+    if let e = email(p) { d["email"] = e }
+    d["is_you"] = p.isCurrentUser
+    switch p.participantStatus {
+    case .accepted:  d["status"] = "accepted"
+    case .declined:  d["status"] = "declined"
+    case .tentative: d["status"] = "tentative"
+    case .pending:   d["status"] = "pending"
+    default:         d["status"] = "unknown"
+    }
+    if p.participantRole == .optional { d["optional"] = true }
+    return d.isEmpty ? nil : d
+}
+
+// Widen the search a little: people join late, recordings start early.
+let pad: TimeInterval = 3 * 3600
+let pred = store.predicateForEvents(withStart: recStart.addingTimeInterval(-pad),
+                                    end: recEnd.addingTimeInterval(pad),
+                                    calendars: nil)
+let candidates = store.events(matching: pred).filter { !$0.isAllDay && $0.status != .canceled }
+
+func overlap(_ ev: EKEvent) -> TimeInterval {
+    guard let s = ev.startDate, let e = ev.endDate else { return 0 }
+    return max(0, min(e, recEnd).timeIntervalSince(max(s, recStart)))
+}
+
+// Best = most seconds overlapping the recording; tie-break on the event whose
+// length is closest to the recording's length.
+let scored = candidates.map { (ev: $0, ov: overlap($0)) }.filter { $0.ov > 0 }
+let best = scored.max { l, r in
+    if l.ov != r.ov { return l.ov < r.ov }
+    func fit(_ e: EKEvent) -> TimeInterval {
+        abs((e.endDate?.timeIntervalSince(e.startDate ?? recStart) ?? 0) - dur)
+    }
+    return fit(l.ev) > fit(r.ev)
+}
+
+var out: [String: Any] = [
+    "recording_start": iso.string(from: recStart),
+    "recording_end":   iso.string(from: recEnd),
+    "recording_duration_seconds": Int(dur.rounded()),
+    "candidates_considered": candidates.count,
+    "source": "EventKit",
+]
+
+if let b = best, let evStart = b.ev.startDate {
+    let ev = b.ev
+    var attendees: [[String: Any]] = []
+    for p in ev.attendees ?? [] { if let d = person(p) { attendees.append(d) } }
+    out["matched"] = true
+    out["title"] = ev.title ?? "(untitled)"
+    out["start"] = iso.string(from: evStart)
+    out["end"] = ev.endDate.map { iso.string(from: $0) } ?? NSNull()
+    out["calendar"] = ev.calendar?.title ?? NSNull()
+    out["event_id"] = ev.eventIdentifier ?? NSNull()
+    out["organizer"] = person(ev.organizer) ?? NSNull()
+    out["attendees"] = attendees
+    out["attendee_count"] = attendees.count
+    out["location"] = (ev.location?.isEmpty == false) ? ev.location! : NSNull()
+    out["url"] = ev.url?.absoluteString ?? NSNull()
+    out["notes"] = (ev.notes?.isEmpty == false) ? ev.notes! : NSNull()
+    out["overlap_seconds"] = Int(b.ov.rounded())
+    out["overlap_fraction_of_recording"] = dur > 0 ? (b.ov / dur * 1000).rounded() / 1000 : 0
+} else {
+    out["matched"] = false
+    out["reason"] = candidates.isEmpty
+        ? "no calendar events near the recording window"
+        : "no calendar event overlaps the recording window"
+}
+
+let data = try JSONSerialization.data(withJSONObject: out, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+FileHandle.standardOutput.write(data)
+FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+SWIFT_EOF
+
+# Only rebuild when the helper is missing or its source actually changed —
+# the heredoc above rewrites the .swift every run, so an mtime test would
+# recompile forever.
+if [ ! -x "$BIN" ] || ! cmp -s "$SRC.new" "$SRC"; then
+    # Compile from a scratch copy and only advance $SRC (the "already built this
+    # source" stamp) once the build has actually succeeded. If the stamp were
+    # moved first, a failed compile would leave the stamp matching the new source
+    # while $BIN was still the OLD binary — and every later run would see
+    # "source unchanged" and silently keep using the stale helper forever.
+    BUILDSRC="$TOOLDIR/.calquery.build.$$.swift"   # swiftc requires a .swift suffix
+    cp -f "$SRC.new" "$BUILDSRC" || { rm -f "$SRC.new"; log "cannot write to $TOOLDIR"; exit 1; }
+    trap 'rm -f "$BUILDSRC" "$SRC.new" "$BIN.tmp.$$"' EXIT
+
+    command -v swiftc >/dev/null 2>&1 || {
+        log "swiftc not found — install the Xcode Command Line Tools (xcode-select --install)"
+        exit 1
+    }
+    log "building EventKit helper (first run only) -> $BIN"
+    if ! swiftc -O -o "$BIN.tmp.$$" "$BUILDSRC" 2>&1; then
+        log "failed to compile the EventKit helper"
+        exit 1
+    fi
+    mv -f "$BIN.tmp.$$" "$BIN" || { log "cannot install $BIN"; exit 1; }
+    mv -f "$SRC.new" "$SRC"      # stamp: only now is $BIN known to match this source
+    rm -f "$BUILDSRC"
+    trap - EXIT
+else
+    rm -f "$SRC.new"
+fi
+
+# --- Query ---------------------------------------------------------------------
+TMP="$OUT.tmp.$$"
+trap 'rm -f "$TMP"' EXIT
+
+ERR="$(mktemp -t 70-calendar)"
+"$BIN" "$REC_DATE" "$REC_TIME" "$DURATION" > "$TMP" 2>"$ERR"
+RC=$?
+
+if [ "$RC" -eq 2 ]; then
+    log "macOS Calendar access is NOT available: $(tr '\n' ' ' < "$ERR")"
+    rm -f "$ERR"
+    log "ACTION REQUIRED (one-off): open System Settings > Privacy & Security > Calendars and turn ON"
+    log "  the app that runs meeting-process — your terminal (Terminal.app / iTerm) if you run it by"
+    log "  hand, or the binary named in the LaunchAgent plist if it runs unattended. If it is not in"
+    log "  the list, run this once from a normal Terminal window so macOS registers it:"
+    log "      \"$BIN\" \"$REC_DATE\" \"$REC_TIME\" \"$DURATION\""
+    log "No output written; this module will retry on the next pipeline pass. Continuing (exit 0)."
+    exit 0
+fi
+
+if [ "$RC" -ne 0 ] || [ ! -s "$TMP" ]; then
+    log "calendar query failed (rc=$RC): $(tr '\n' ' ' < "$ERR")"
+    rm -f "$ERR"
+    exit 1
+fi
+rm -f "$ERR"
+
+# Sanity-check the JSON before it lands.
+if command -v jq >/dev/null 2>&1; then
+    jq -e . "$TMP" >/dev/null 2>&1 || { log "calendar query produced invalid JSON"; exit 1; }
+fi
+
+mv -f "$TMP" "$OUT"
+trap - EXIT
+
+if command -v jq >/dev/null 2>&1 && [ "$(jq -r '.matched' "$OUT")" = "true" ]; then
+    log "matched \"$(jq -r '.title' "$OUT")\" ($(jq -r '.attendee_count' "$OUT") attendees, $(jq -r '.overlap_seconds' "$OUT")s overlap) -> $(basename "$OUT")"
+else
+    log "no calendar event overlaps this recording (ad-hoc call) -> $(basename "$OUT")"
+fi
+exit 0

@@ -1,0 +1,667 @@
+#!/opt/homebrew/bin/python3
+"""
+60-threads — cross-meeting topic threading.
+
+Answers: "this is the 4th meeting about the scAtlas — here's what CHANGED
+since last time and what's still open."
+
+Outputs:
+  <MEETING_DIR>/<base>_thread.md   thread membership + progress delta
+  <MEETING_ROOT>/_threads.json     persistent thread name -> [meeting dirs]
+
+Strategy (cost-bounded: at most 2 `claude -p` calls):
+  stage 1  cheap  — TL;DR of each prior meeting -> which belong to this thread
+  stage 2  richer — full summaries of the <=4 most recent matches -> the delta
+
+Stdlib only. No network beyond the `claude` CLI.
+"""
+
+import errno
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+# --- tunables -----------------------------------------------------------
+MAX_PRIORS_SCANNED = 40    # newest N priors considered for thread matching
+MAX_THREAD_CONTEXT = 4     # matched priors pulled at full context (spec cap)
+TLDR_CHARS = 700           # per-prior budget in the cheap stage
+CONTEXT_CHARS = 4000       # per-prior budget in the delta stage
+CURRENT_CHARS = 6000       # current meeting budget in the delta stage
+CLAUDE_TIMEOUT = 420       # seconds per call
+CLAUDE_RETRIES = 1         # one retry on failure/timeout
+
+SECTIONS = ("## What changed since last time", "## Still open", "## Newly opened")
+
+
+def log(msg):
+    print(f"[60-threads] {msg}", flush=True)
+
+
+def die(msg, code=1):
+    print(f"[60-threads] ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# --- claude -------------------------------------------------------------
+
+def resolve_claude():
+    """The pipeline exports a restricted PATH that does NOT include
+    ~/.local/bin, where claude actually lives. Resolve it explicitly."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    for cand in (
+        os.path.expanduser("~/.local/bin/claude"),
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+    ):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def run_claude(claude_bin, prompt, payload, validate=None):
+    """`claude -p <prompt>` with payload on stdin. Returns the validated result
+    (or raw stdout when no validator), or None.
+
+    `validate` maps raw stdout -> parsed value, or None if the response does not
+    satisfy the schema we asked for. A schema-invalid answer is treated exactly
+    like a failed call: it burns a retry and, if it never validates, yields None
+    so the caller writes NO output and the next pipeline run retries. Accepting
+    an off-schema answer would produce a complete-looking file that idempotency
+    then guarantees is never regenerated."""
+    for attempt in range(CLAUDE_RETRIES + 1):
+        try:
+            proc = subprocess.run(
+                [claude_bin, "-p", prompt],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=CLAUDE_TIMEOUT,
+                # keep claude out of any repo-local config / MCP surprises
+                cwd=tempfile.gettempdir(),
+            )
+        except subprocess.TimeoutExpired:
+            log(f"claude timed out (attempt {attempt + 1})")
+            continue
+        except OSError as exc:
+            log(f"claude failed to launch: {exc}")
+            return None
+        out = (proc.stdout or "").strip()
+        if proc.returncode == 0 and out:
+            if validate is None:
+                return out
+            checked = validate(out)
+            if checked is not None:
+                return checked
+            log(f"claude returned an off-schema response (attempt {attempt + 1}): "
+                f"{out[:160]!r}")
+        else:
+            log(f"claude rc={proc.returncode} (attempt {attempt + 1}): "
+                f"{(proc.stderr or '').strip()[:200]}")
+        time.sleep(2)
+    return None
+
+
+def parse_json_loose(text):
+    """claude sometimes wraps JSON in prose or ``` fences."""
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fenced:
+        text = fenced.group(1)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def validate_verdict(text):
+    """Schema gate for stage 1. Returns the verdict dict, or None if claude gave
+    us prose, `{}`, or the right keys with the wrong types (`"thread": 42`,
+    `"standalone": "no"`, `"matches": "a-name"`). Anything we cannot fully trust
+    must fail the run rather than be coerced into a plausible-looking file."""
+    obj = parse_json_loose(text)
+    if not isinstance(obj, dict):
+        return None
+    thread = obj.get("thread")
+    if not isinstance(thread, str) or not thread.strip():
+        return None
+    standalone = obj.get("standalone", False)
+    if not isinstance(standalone, bool):
+        return None
+    matches = obj.get("matches", [])
+    if matches is None:
+        matches = []
+    if not isinstance(matches, list) or not all(isinstance(n, str) for n in matches):
+        return None
+    return {"thread": thread, "standalone": standalone, "matches": matches}
+
+
+def validate_delta(text):
+    """Schema gate for stage 2: the body must actually contain the sections we
+    asked for. A prose reply ("Sure! I think...") padded out with '- _None._'
+    stubs is indistinguishable from a real, empty delta once written."""
+    body = text.strip()
+    idx = body.find(SECTIONS[0])
+    if idx > 0:
+        body = body[idx:]           # drop any preamble
+    if not any(section in body for section in SECTIONS):
+        return None
+    for section in SECTIONS:        # never ship a file missing a promised section
+        if section not in body:
+            body += f"\n\n{section}\n- _None._"
+    return body
+
+
+# --- meeting discovery --------------------------------------------------
+
+DATE_PATTERNS = (
+    # 2026-07-14_12-33 (canonical, and survives most renames)
+    (re.compile(r"(\d{4})-(\d{2})-(\d{2})[_ T]?(\d{2})[-:](\d{2})"),
+     lambda m: (int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5]))),
+    # 2026-07-14
+    (re.compile(r"(\d{4})-(\d{2})-(\d{2})"),
+     lambda m: (int(m[1]), int(m[2]), int(m[3]), 0, 0)),
+    # ZoomMeeting_06.14.2026  (MM.DD.YYYY)
+    (re.compile(r"(\d{2})\.(\d{2})\.(\d{4})"),
+     lambda m: (int(m[3]), int(m[1]), int(m[2]), 0, 0)),
+)
+
+
+def sort_key(meeting_dir, summary_path):
+    """Order meetings chronologically. Folders may have been renamed by the
+    title module, so try the summary filename, then the folder name, then
+    fall back to the summary's mtime."""
+    for text in (os.path.basename(summary_path), os.path.basename(meeting_dir)):
+        for pattern, build in DATE_PATTERNS:
+            m = pattern.search(text)
+            if m:
+                try:
+                    return datetime(*build(m)).timestamp()
+                except ValueError:
+                    pass
+    try:
+        return os.path.getmtime(summary_path)
+    except OSError:
+        return 0.0
+
+
+def find_summary(meeting_dir):
+    try:
+        names = sorted(os.listdir(meeting_dir))
+    except OSError:
+        return None
+    for name in names:
+        if name.endswith("_summary.md"):
+            path = os.path.join(meeting_dir, name)
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                return path
+    return None
+
+
+def discover_meetings(root, current_dir):
+    """All meetings under root with a non-empty summary, excluding current."""
+    out = []
+    current_real = os.path.realpath(current_dir)
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as exc:
+        die(f"cannot read MEETING_ROOT {root}: {exc}")
+    for name in entries:
+        if name.startswith("."):
+            continue
+        d = os.path.join(root, name)
+        if not os.path.isdir(d) or os.path.realpath(d) == current_real:
+            continue
+        summary = find_summary(d)
+        if summary:
+            out.append({"dir": d, "name": name, "summary": summary,
+                        "key": sort_key(d, summary)})
+    out.sort(key=lambda m: m["key"])
+    return out
+
+
+def read_text(path, limit=None):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    data = data.strip()
+    if limit and len(data) > limit:
+        data = data[:limit].rsplit("\n", 1)[0] + "\n[...truncated]"
+    return data
+
+
+def extract_tldr(summary_path):
+    text = read_text(summary_path)
+    m = re.search(r"^##\s*TL;?DR\s*$\n(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+    body = (m.group(1) if m else text).strip()
+    body = re.sub(r"\n{2,}", "\n", body)
+    return body[:TLDR_CHARS] if body else "(no summary content)"
+
+
+# --- _threads.json ------------------------------------------------------
+
+def load_threads(root):
+    """Existing thread map, or {} if absent/corrupt."""
+    try:
+        with open(os.path.join(root, "_threads.json"), "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        threads = loaded.get("threads")
+        if isinstance(threads, dict):
+            return {k: v.get("meetings", []) for k, v in threads.items()
+                    if isinstance(v, dict) and isinstance(v.get("meetings"), list)}
+    except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    return {}
+
+
+def reconcile_thread_name(proposed, matches, existing):
+    """The LLM will happily call the same project 'CRC scRNA-seq atlas' one run
+    and 'CRC single-cell atlas' the next, which would fork _threads.json into
+    duplicate threads. If a majority of the matched priors already live in an
+    existing thread, that thread IS this thread — reuse its name verbatim."""
+    if not matches or not existing:
+        return proposed
+    matched = set(matches)
+    best, best_overlap = None, 0
+    for name, members in existing.items():
+        overlap = len(matched & set(members))
+        if overlap > best_overlap:
+            best, best_overlap = name, overlap
+    if best and best_overlap * 2 >= len(matched):
+        if best != proposed:
+            log(f"reusing existing thread {best!r} (was going to say {proposed!r}; "
+                f"{best_overlap}/{len(matched)} matched priors already in it)")
+        return best
+    return proposed
+
+
+def resolve_member(root, name, index=None):
+    """Map a recorded member name onto the folder it lives in TODAY.
+
+    90-title renames meeting folders after we record them, so a name written
+    last week may name a folder that no longer exists. The summary FILE is never
+    renamed, so `<root>/<new-folder>/<old-stem>_summary.md` still identifies it.
+    Returns the current folder name, or None if the meeting is really gone."""
+    if os.path.isdir(os.path.join(root, name)):
+        return name
+    if index is None:
+        index = summary_stem_index(root)
+    return index.get(name)
+
+
+def summary_stem_index(root):
+    """{summary stem -> folder name} for every meeting under root. The stem is
+    the meeting's original (pre-rename) folder name."""
+    index = {}
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return index
+    for name in entries:
+        if name.startswith("."):
+            continue
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        summary = find_summary(d)
+        if summary:
+            stem = os.path.basename(summary)[:-len("_summary.md")]
+            index.setdefault(stem, name)
+    return index
+
+
+def update_threads_json(root, thread_name, member_names):
+    """Read/merge/write. Members whose folder was renamed by the title module are
+    REMAPPED to their current folder, not dropped: dropping them silently erodes
+    thread history, which is the one thing this file exists to keep."""
+    path = os.path.join(root, "_threads.json")
+    # hidden: the lock necessarily outlives the run (unlinking it would let a
+    # concurrent module lock a different inode), so keep it out of the vault's
+    # visible content.
+    lock_path = os.path.join(root, "._threads.json.lock")
+
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:
+            pass
+
+        data = {}
+        corrupt = False
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = fh.read()
+            loaded = json.loads(raw) if raw.strip() else {}
+            if isinstance(loaded, dict) and isinstance(loaded.get("threads"), dict):
+                data = loaded["threads"]
+            elif raw.strip():
+                corrupt = True   # parses, but is not our schema
+        except FileNotFoundError:
+            pass                 # first ever run
+        except (json.JSONDecodeError, ValueError):
+            corrupt = True
+
+        if corrupt:
+            # NEVER silently rebuild from {}: that erases every thread ever
+            # recorded. Preserve the bytes so the history can be recovered by
+            # hand, and say so loudly.
+            keep = f"{path}.corrupt-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+            try:
+                os.replace(path, keep)
+                log(f"WARNING: _threads.json is unparseable; preserved it as "
+                    f"{os.path.basename(keep)} and starting a fresh map. "
+                    f"Thread history in that file must be merged back by hand.")
+            except OSError as exc:
+                die(f"_threads.json is corrupt and could not be backed up ({exc}); "
+                    f"refusing to overwrite it")
+            data = {}
+
+        # reuse an existing key that differs only by case/spacing
+        key = thread_name
+        norm = thread_name.strip().lower()
+        for existing in data:
+            if existing.strip().lower() == norm:
+                key = existing
+                break
+
+        entry = data.get(key) or {}
+        members = entry.get("meetings", [])
+        if not isinstance(members, list):
+            members = []
+        for name in member_names:
+            if name not in members:
+                members.append(name)
+
+        # follow renames instead of pruning; drop only what is truly gone
+        index = summary_stem_index(root)
+        resolved, seen = [], set()
+        for n in members:
+            if not isinstance(n, str):
+                continue
+            cur = resolve_member(root, n, index)
+            if cur is None:
+                log(f"thread member {n!r} no longer exists under root — dropping")
+                continue
+            if cur != n:
+                log(f"thread member {n!r} was renamed to {cur!r} — following")
+            if cur not in seen:
+                seen.add(cur)
+                resolved.append(cur)
+        members = resolved
+        members.sort(key=lambda n: sort_key(os.path.join(root, n),
+                                            find_summary(os.path.join(root, n)) or n))
+
+        data[key] = {
+            "meetings": members,
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+        payload = {"threads": dict(sorted(data.items()))}
+        fd, tmp = tempfile.mkstemp(dir=root, prefix="._threads.", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=False)
+                fh.write("\n")
+            os.chmod(tmp, 0o644)  # mkstemp is 0600; match the rest of the vault
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
+    return path, data[key]["meetings"]
+
+
+def write_atomic(path, content):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".thread.", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp, 0o644)  # mkstemp is 0600; match the rest of the vault
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def ordinal(n):
+    if 10 <= n % 100 <= 20:
+        suf = "th"
+    else:
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
+
+
+# --- prompts ------------------------------------------------------------
+
+MATCH_PROMPT = """You are grouping meetings into ongoing project threads.
+
+Below is the TL;DR of a CURRENT meeting, then TL;DRs of PRIOR meetings.
+Decide which prior meetings belong to the SAME ongoing project/topic thread
+as the current meeting - i.e. recurring meetings about the same body of work,
+where the current meeting continues, revisits or advances that work.
+
+Be inclusive about superficial differences (a short check-in, a garbled or
+mostly-empty recording, a logistics detour) when the underlying project is
+clearly the same. Be strict about genuinely different projects.
+
+If an EXISTING THREADS section is present and this meeting continues one of those
+threads, you MUST reuse that thread's name EXACTLY as written - do not reword,
+re-abbreviate or re-punctuate it. Only invent a new name for a genuinely new project.
+
+Reply with ONLY a JSON object, no prose:
+{"thread": "<short human thread name, e.g. 'Colorectal cancer scAtlas'>",
+ "standalone": false,
+ "matches": ["<prior id>", "..."],
+ "rationale": "<one sentence>"}
+
+If no prior meeting is about the same project, set "standalone": true, use an
+empty "matches" list, and still give the current meeting's own thread name."""
+
+DELTA_PROMPT = """You are writing a progress delta for a recurring project meeting.
+
+You get the summaries of PRIOR meetings in this thread (oldest first), then the
+CURRENT meeting's summary. Write what actually MOVED - do not restate the current
+meeting, and do not repeat what the prior meetings already said.
+
+Output EXACTLY these three markdown sections, nothing else (no preamble, no
+title, no closing commentary):
+
+## What changed since last time
+Concrete deltas vs the prior meetings: what got done, decided, reversed,
+renamed, discovered or abandoned. Each bullet must contrast then -> now.
+Cite which prior meeting a change is relative to where it helps.
+
+## Still open
+Questions/decisions/blockers raised in PRIOR meetings that are STILL unresolved
+as of the current meeting. Omit anything the current meeting resolved. Note how
+long an item has been carried if it spans several meetings.
+
+## Newly opened
+Questions, blockers or decisions raised for the FIRST TIME in the current meeting.
+
+Rules: terse bullets; specifics (names, files, parameters) over generalities.
+If a section genuinely has nothing, write a single bullet: "- _None._"
+Do not invent anything that is not supported by the summaries."""
+
+
+# --- main ---------------------------------------------------------------
+
+def main():
+    meeting_dir = (sys.argv[1] if len(sys.argv) > 1
+                   else os.environ.get("MEETING_DIR", "")).rstrip("/")
+    if not meeting_dir or not os.path.isdir(meeting_dir):
+        die(f"usage: 60-threads <MEETING_DIR>  (got: {meeting_dir!r})", 2)
+    meeting_dir = os.path.abspath(meeting_dir)
+
+    root = os.environ.get("MEETING_ROOT") or os.path.dirname(meeting_dir)
+    summary = os.environ.get("MEETING_SUMMARY") or find_summary(meeting_dir)
+    if not summary or not os.path.isfile(summary):
+        die("no summary found for this meeting")
+    base = os.environ.get("MEETING_BASE") or \
+        os.path.basename(summary)[:-len("_summary.md")]
+
+    out_path = os.path.join(meeting_dir, f"{base}_thread.md")
+
+    # rule 6: idempotency check first, before any work
+    if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        log(f"{os.path.basename(out_path)} exists — nothing to do")
+        return 0
+
+    current_name = os.path.basename(meeting_dir)
+    current_key = sort_key(meeting_dir, summary)
+
+    # only meetings STRICTLY BEFORE this one are "prior"
+    priors = [m for m in discover_meetings(root, meeting_dir)
+              if m["key"] < current_key]
+    log(f"{len(priors)} prior meeting(s) with summaries under {root}")
+
+    if not priors:
+        write_atomic(out_path, (
+            f"# Thread\n\n"
+            f"**Thread:** _first meeting_\n\n"
+            f"This is the first meeting with a summary in `{os.path.basename(root)}` — "
+            f"there are no prior meetings to compare against, so there is no progress "
+            f"delta yet. Once a later meeting revisits this work, it will link back here.\n\n"
+            "## What changed since last time\n- _Nothing to compare — first meeting._\n\n"
+            "## Still open\n- _None carried over._\n\n"
+            "## Newly opened\n"
+            f"- See the open questions in [`{os.path.basename(summary)}`]"
+            f"(./{os.path.basename(summary)}).\n"))
+        log("no priors — wrote first-in-thread stub")
+        return 0
+
+    claude_bin = resolve_claude()
+    if not claude_bin:
+        die("claude CLI not found on PATH or in ~/.local/bin")
+
+    # ---- stage 1: cheap thread identification from TL;DRs ----
+    scanned = priors[-MAX_PRIORS_SCANNED:]
+    existing = load_threads(root)
+    lines = ["### CURRENT MEETING", f"id: {current_name}",
+             f"tldr: {extract_tldr(summary)}", ""]
+    if existing:
+        lines.append("### EXISTING THREADS (reuse a name verbatim if it fits)")
+        for name, members in existing.items():
+            lines.append(f"- {name}  (meetings: {', '.join(members)})")
+        lines.append("")
+    lines.append("### PRIOR MEETINGS (oldest first)")
+    for m in scanned:
+        lines += ["", f"id: {m['name']}", f"tldr: {extract_tldr(m['summary'])}"]
+    verdict = run_claude(claude_bin, MATCH_PROMPT, "\n".join(lines),
+                         validate=validate_verdict)
+    if not verdict:
+        die("thread identification failed (no schema-valid JSON from claude); "
+            "writing nothing so the next run retries")
+
+    thread = re.sub(r"\s+", " ", verdict["thread"].strip())[:80]
+    if not thread:
+        die("claude returned an empty thread name")
+    by_name = {m["name"]: m for m in scanned}
+    matches = [by_name[n] for n in verdict["matches"] if n in by_name]
+    matches.sort(key=lambda m: m["key"])
+    standalone = verdict["standalone"] or not matches
+    if standalone:
+        # claude sometimes says standalone=true AND still lists matches. The
+        # markdown would claim "no prior meeting covers this project" while
+        # _threads.json recorded those priors as thread members — a
+        # contradiction downstream consumers (80-obsidian, 85-index) would
+        # read straight out of the JSON. Standalone wins: no priors.
+        matches = []
+    # deterministic backstop against LLM thread-name drift
+    thread = reconcile_thread_name(thread, [m["name"] for m in matches], existing)
+    log(f"thread={thread!r} standalone={standalone} matches={len(matches)}")
+
+    members = [m["name"] for m in matches] + [current_name]
+    header = [f"# Thread: {thread}", ""]
+
+    if standalone:
+        # nothing else can fail from here — safe to commit shared state now
+        json_path, _ = update_threads_json(root, thread, members)
+        log(f"updated {json_path}")
+        header += [
+            "**This meeting is standalone** — no prior meeting covers the same project.",
+            "", f"It is recorded in `_threads.json` as the first meeting of the "
+            f"*{thread}* thread.", "",
+            "## What changed since last time",
+            "- _None — no prior meeting in this thread._", "",
+            "## Still open", "- _None carried over._", "",
+            "## Newly opened",
+            f"- See the open questions in [`{os.path.basename(summary)}`]"
+            f"(./{os.path.basename(summary)}).", ""]
+        write_atomic(out_path, "\n".join(header))
+        log(f"wrote {out_path} (standalone)")
+        return 0
+
+    # ---- stage 2: delta against the <=4 most recent matches ----
+    # Do this BEFORE touching _threads.json: if the delta fails we must leave no
+    # trace at all, so the retry starts from a clean slate rather than from a
+    # half-committed membership record.
+    recent = matches[-MAX_THREAD_CONTEXT:]
+    payload = ["### PRIOR MEETINGS IN THIS THREAD (oldest first)"]
+    for m in recent:
+        payload += ["", f"--- prior meeting: {m['name']} ---",
+                    read_text(m["summary"], CONTEXT_CHARS)]
+    payload += ["", f"### CURRENT MEETING: {current_name}",
+                read_text(summary, CURRENT_CHARS)]
+    body = run_claude(claude_bin, DELTA_PROMPT, "\n".join(payload),
+                      validate=validate_delta)
+    if not body:
+        die("delta generation failed (claude returned nothing usable); "
+            "writing nothing so the next run retries")
+
+    json_path, all_members = update_threads_json(root, thread, members)
+    log(f"updated {json_path}")
+    position = sum(1 for n in all_members
+                   if sort_key(os.path.join(root, n),
+                               find_summary(os.path.join(root, n)) or n) <= current_key)
+
+    header += [
+        f"**{ordinal(position)} meeting in this thread.** "
+        f"{len(matches)} prior meeting(s) matched; delta computed against the "
+        f"{len(recent)} most recent.", "",
+        "## Prior meetings in this thread", ""]
+    for m in matches:
+        rel = os.path.relpath(m["summary"], meeting_dir)
+        marker = "" if m in recent else "  _(context only)_"
+        header.append(f"- [{m['name']}]({rel}){marker}")
+    header += ["", "---", ""]
+
+    write_atomic(out_path, "\n".join(header) + body.strip() + "\n")
+    log(f"wrote {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            die("out of disk space")
+        die(f"{exc}")

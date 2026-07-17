@@ -1,0 +1,72 @@
+#!/bin/zsh
+# meeting-migrate — one-time move of recordings out of the git repo and into a
+# standalone library, leaving a symlink behind so nothing that referenced the
+# old path breaks.
+#
+# Only touches folders this pipeline created (they carry a `.meeting` marker or
+# OBS's *_meeting name). The legacy ZoomMeeting_* folders contain git-TRACKED
+# .docx.gpg notes and are deliberately left exactly where they are.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+OLD="$HOME/Documents/GitHub/BruceLab/docs/Meetings"
+NEW="$HOME/Recordings/Meetings"
+DRY="${DRY_RUN:-0}"
+
+setopt null_glob
+mkdir -p "$NEW"
+
+# Same volume => mv is an atomic rename (instant), not a 6.6GB copy.
+if [[ "$(/usr/bin/stat -f%d "$OLD")" != "$(/usr/bin/stat -f%d "$NEW")" ]]; then
+    print -r -- "WARNING: different volumes — this will be a slow copy, not a rename."
+fi
+
+moved=0 skipped=0
+for d in "$OLD"/*(/N); do
+    name="${d:t}"
+
+    # Never move the legacy, git-tracked Zoom note folders.
+    if [[ "$name" == ZoomMeeting_* ]]; then
+        print -r -- "keep (git-tracked notes): $name"
+        (( skipped++ )); continue
+    fi
+    # Only ours.
+    [[ -f "$d/.meeting" || "$name" == *_meeting ]] || { (( skipped++ )); continue; }
+    # Already a symlink => already migrated.
+    [[ -L "$d" ]] && { (( skipped++ )); continue; }
+
+    target="$NEW/$name"
+    if [[ -e "$target" ]]; then
+        print -r -- "SKIP (exists in library): $name"
+        (( skipped++ )); continue
+    fi
+
+    before_n=$(find "$d" -type f | wc -l | tr -d ' ')
+    before_b=$(du -sk "$d" | cut -f1)
+
+    if (( DRY )); then
+        print -r -- "DRY: would move $name ($before_n files, ${before_b}K)"
+        continue
+    fi
+
+    mv "$d" "$target" || { print -r -- "FAILED to move $name"; continue; }
+
+    # Verify the move landed intact BEFORE we create the symlink that makes the
+    # old path look fine. If anything is off, put it back and stop.
+    after_n=$(find "$target" -type f | wc -l | tr -d ' ')
+    after_b=$(du -sk "$target" | cut -f1)
+    if [[ "$before_n" != "$after_n" || "$before_b" != "$after_b" ]]; then
+        print -r -- "MISMATCH after moving $name ($before_n/$before_b -> $after_n/$after_b) — rolling back"
+        mv "$target" "$d"
+        exit 1
+    fi
+
+    ln -s "$target" "$d" || print -r -- "WARN: moved but could not symlink back: $name"
+    print -r -- "moved: $name ($after_n files, ${after_b}K) + symlink left behind"
+    (( moved++ ))
+done
+
+print -r -- ""
+print -r -- "moved=$moved skipped=$skipped"
+print -r -- "library: $NEW"

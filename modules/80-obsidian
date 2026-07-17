@@ -1,0 +1,832 @@
+#!/usr/bin/env python3
+"""80-obsidian — turn a processed meeting into a backlinked Obsidian note.
+
+Consumes whatever upstream modules produced (chapters, insights, slides,
+speakers, threads, calendar) — every one of them is optional. Writes:
+
+    $OBSIDIAN_VAULT/Meetings/<date> <title>.md
+
+plus stub notes for linked people/topics so no wikilink is broken. A
+controlled vocabulary at $MEETING_TOOLS/obsidian/entities.json keeps the
+same person/topic pointing at the same note across meetings.
+
+Stdlib only (python3 3.14 is fine). All vault writes are atomic.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import urllib.parse
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# environment
+# --------------------------------------------------------------------------
+
+USER_MARKER = "## Notes"
+
+# Any name containing one of these tokens is a role/placeholder, not a person:
+# "Participant (lead)", "Team", "You", "Speaker 2" must not become notes.
+NOT_A_PERSON_TOKENS = {
+    "you", "me", "we", "us", "team", "everyone", "everybody", "all", "both",
+    "participant", "participants", "attendee", "attendees", "lead", "recorder",
+    "someone", "anyone", "unknown", "speaker", "guest", "host", "others",
+    "n", "a", "tbd", "na", "group", "folks", "person",
+}
+
+# Generic words that make useless topic notes.
+NOT_A_TOPIC = {
+    "meeting", "call", "data", "dataset", "file", "files", "link", "test",
+    "version", "paper", "the", "todo", "misc", "other", "notes", "analysis",
+    "project", "work", "thing", "stuff", "update", "review", "discussion",
+}
+
+
+# How many distinct meetings a term must appear in before it earns its own
+# linked topic note. 1 would mean every passing bit of jargon becomes a note.
+MIN_TOPIC_MEETINGS = 2
+
+_TERM_COUNTS: dict[str, int] | None = None
+
+
+def _load_term_counts() -> dict[str, int]:
+    """Count, across every meeting's insights, how many meetings mention a term."""
+    counts: dict[str, int] = {}
+    root = os.environ.get("MEETING_ROOT", "")
+    if not root:
+        return counts
+    for path in Path(root).glob("*/*_insights.json"):
+        seen: set[str] = set()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue          # a malformed insights file must not break the note
+        if not isinstance(data, dict):
+            continue
+        for key in ("jargon", "terms", "key_terms", "glossary", "topics",
+                    "entities", "keywords"):
+            val = data.get(key)
+            if not isinstance(val, list):
+                continue
+            for item in val:
+                term = ""
+                if isinstance(item, str):
+                    term = item
+                elif isinstance(item, dict):
+                    for k in ("term", "name", "text", "topic", "keyword"):
+                        if isinstance(item.get(k), str):
+                            term = item[k]
+                            break
+                term = term.strip().lower()
+                if term:
+                    seen.add(term)
+        for term in seen:
+            counts[term] = counts.get(term, 0) + 1
+    return counts
+
+
+def term_meeting_count(term: str) -> int:
+    global _TERM_COUNTS
+    if _TERM_COUNTS is None:
+        _TERM_COUNTS = _load_term_counts()
+    return _TERM_COUNTS.get(str(term).strip().lower(), 0)
+
+
+def log(msg: str) -> None:
+    print(f"[80-obsidian] {msg}", flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[80-obsidian] ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def load_json(path: Path):
+    """Best-effort JSON load. Never raises — a broken upstream file just
+    means that enrichment is missing, not that the note fails to write."""
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            with path.open(encoding="utf-8") as fh:
+                return json.load(fh)
+    except Exception as exc:  # noqa: BLE001 — deliberately fail-soft
+        log(f"warn: could not read {path.name}: {exc}")
+    return None
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Write via temp file + os.replace, on the same filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".80-obsidian.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def safe_filename(name: str) -> str:
+    """Strip characters Obsidian / macOS dislike in a file name."""
+    name = name.replace("/", "-").replace(":", " -").replace("\\", "-")
+    name = re.sub(r'[*?"<>|#^\[\]]', "", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:120] or "meeting"
+
+
+def yaml_str(value: str) -> str:
+    """Quote a scalar for YAML frontmatter."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def file_url(path: Path) -> str:
+    return "file://" + urllib.parse.quote(str(path))
+
+
+def norm(name: str) -> str:
+    """Normalised key for vocabulary lookups."""
+    s = unicodedata.normalize("NFKD", str(name)).casefold()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def hhmmss(seconds: float) -> str:
+    seconds = max(0, int(seconds))  # a garbage negative offset must not render as "-1:59:55"
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def parse_clock(value) -> int | None:
+    """Accept 93, '93', '01:33', '00:01:33', '00:01:33,250' -> seconds."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    v = value.strip().replace(",", ".")
+    if re.fullmatch(r"\d+(\.\d+)?", v):
+        return int(float(v))
+    m = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)", v)
+    if not m:
+        return None
+    h, mnt, sec = m.group(1) or 0, m.group(2), m.group(3)
+    return int(h) * 3600 + int(mnt) * 60 + int(float(sec))
+
+
+def first_key(obj, *keys):
+    """Return the first present, non-empty value among keys of a dict."""
+    if not isinstance(obj, dict):
+        return None
+    for k in keys:
+        if k in obj and obj[k] not in (None, "", [], {}):
+            return obj[k]
+    return None
+
+
+def as_list(obj, *keys):
+    """Coerce an upstream blob into a list. Accepts a bare list, or a dict
+    with any of `keys` holding the list."""
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, list):
+                return v
+        # a dict-of-dicts, e.g. {"Participants": {...}}
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, dict):
+                return list(v.values())
+    return []
+
+
+def text_of(item, *keys) -> str:
+    """Pull a display string out of a str-or-dict list element."""
+    if isinstance(item, str):
+        return item.strip()
+    if isinstance(item, dict):
+        v = first_key(item, *keys)
+        if isinstance(v, str):
+            return v.strip()
+    return ""
+
+
+# --------------------------------------------------------------------------
+# summary parsing
+# --------------------------------------------------------------------------
+
+def split_sections(markdown: str) -> dict[str, str]:
+    """Map lowercased heading -> body text, for ##/### headings."""
+    sections: dict[str, str] = {}
+    current = None
+    buf: list[str] = []
+    for line in markdown.splitlines():
+        m = re.match(r"^#{1,4}\s+(.*?)\s*$", line)
+        if m:
+            if current is not None:
+                sections[current] = "\n".join(buf).strip()
+            current = norm(m.group(1))
+            buf = []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf).strip()
+    # Trailing "---\n*Note: ...*" footers belong to the summary, not to the
+    # last section they happen to sit under.
+    for k, v in sections.items():
+        sections[k] = re.split(r"^\s*(?:---|\*\*\*|___)\s*$", v, maxsplit=1, flags=re.MULTILINE)[0].strip()
+    return sections
+
+
+def pick_section(sections: dict[str, str], *wanted: str) -> str:
+    for w in wanted:
+        key = norm(w)
+        if sections.get(key):
+            return sections[key]
+    # substring fallback ("key points and themes")
+    for w in wanted:
+        key = norm(w)
+        for k, v in sections.items():
+            if key and key in k and v:
+                return v
+    return ""
+
+
+# --------------------------------------------------------------------------
+# controlled vocabulary
+# --------------------------------------------------------------------------
+
+class Vocabulary:
+    """Persistent alias -> canonical map, so [[Bob]] and [[Bob Aronow]] never
+    become two different notes."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.entities: list[dict] = []
+        self.dirty = False
+        data = load_json(path)
+        if isinstance(data, dict) and isinstance(data.get("entities"), list):
+            for ent in data["entities"]:
+                if isinstance(ent, dict) and ent.get("canonical"):
+                    ent.setdefault("type", "topic")
+                    ent.setdefault("aliases", [])
+                    self.entities.append(ent)
+
+    def _find(self, name: str, etype: str) -> dict | None:
+        key = norm(name)
+        if not key:
+            return None
+        for ent in self.entities:
+            if ent["type"] != etype:
+                continue
+            if key == norm(ent["canonical"]) or key in {norm(a) for a in ent["aliases"]}:
+                return ent
+        # People only: "Bob" should resolve into an existing "Bob Aronow"
+        # (and vice versa) rather than spawning a second note. Match on token
+        # containment, which is safe for names but far too loose for topics.
+        if etype == "person":
+            tokens = set(key.split())
+            for ent in self.entities:
+                if ent["type"] != "person":
+                    continue
+                for cand in [ent["canonical"], *ent["aliases"]]:
+                    ctokens = set(norm(cand).split())
+                    if not tokens or not ctokens:
+                        continue
+                    if tokens <= ctokens or ctokens <= tokens:
+                        return ent
+        return None
+
+    def resolve(self, name: str, etype: str) -> str | None:
+        """Return the canonical note name for `name`, registering it if new."""
+        name = re.sub(r"\s+", " ", str(name)).strip().strip(".,;:")
+        if not name or len(name) < 2:
+            return None
+        key = norm(name)
+        if not key:
+            return None
+        if etype == "person" and set(key.split()) & NOT_A_PERSON_TOKENS:
+            return None
+        if etype == "topic" and (key in NOT_A_TOPIC or len(key) < 3):
+            return None
+
+        ent = self._find(name, etype)
+        if ent is None:
+            ent = {"canonical": name, "type": etype, "aliases": [name]}
+            self.entities.append(ent)
+            self.dirty = True
+            return ent["canonical"]
+
+        if key not in {norm(a) for a in ent["aliases"]}:
+            ent["aliases"].append(name)
+            self.dirty = True
+        # Prefer the most specific form of a person's name as the note title.
+        if etype == "person" and len(name.split()) > len(ent["canonical"].split()):
+            ent["canonical"] = name
+            self.dirty = True
+        return ent["canonical"]
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        self.entities.sort(key=lambda e: (e["type"], norm(e["canonical"])))
+        atomic_write(
+            self.path,
+            json.dumps({"version": 1, "entities": self.entities}, indent=2, ensure_ascii=False) + "\n",
+        )
+
+
+# --------------------------------------------------------------------------
+# wikilinking
+# --------------------------------------------------------------------------
+
+def linkify(text: str, links: dict[str, str]) -> str:
+    """Wrap known aliases in [[Canonical|alias]]. Skips headings, code fences,
+    existing wikilinks and markdown link targets."""
+    if not text or not links:
+        return text
+    # Longest alias first so "colorectal cancer single cell atlas" wins over
+    # "colorectal cancer".
+    aliases = sorted(links, key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<![\w\[/|#-])(" + "|".join(re.escape(a) for a in aliases) + r")(?![\w\]/|-])",
+        re.IGNORECASE,
+    )
+
+    out: list[str] = []
+    in_code = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        if in_code or line.lstrip().startswith("#"):
+            out.append(line)
+            continue
+
+        # Protect spans we must not touch: existing wikilinks and md links.
+        holes: list[tuple[int, int]] = [
+            (m.start(), m.end())
+            for m in re.finditer(r"\[\[[^\]]*\]\]|\[[^\]]*\]\([^)]*\)|`[^`]*`", line)
+        ]
+
+        def in_hole(pos: int) -> bool:
+            return any(s <= pos < e for s, e in holes)
+
+        def repl(m: re.Match) -> str:
+            if in_hole(m.start()):
+                return m.group(0)
+            surface = m.group(1)
+            # re.IGNORECASE can match characters whose .lower() is not the key
+            # we built the pattern from (e.g. 'ſ' matches 's'); never KeyError.
+            canonical = links.get(surface.lower())
+            if canonical is None:
+                return m.group(0)
+            if surface.lower() == canonical.lower():
+                return f"[[{canonical}]]"
+            return f"[[{canonical}|{surface}]]"
+
+        out.append(pattern.sub(repl, line))
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# stub notes
+# --------------------------------------------------------------------------
+
+def note_belongs_to(path: Path, meeting_dir: Path, base: str) -> bool:
+    """Does the note already at `path` describe THIS meeting?
+
+    Two meetings on the same day with no calendar title both want
+    "<date> meeting.md". Without this check the second one either clobbers the
+    first or is silently skipped by the idempotency test. Reads only the YAML
+    frontmatter (a few hundred bytes). A note with neither marker — e.g. one the
+    user wrote by hand — is treated as NOT ours, so we never overwrite it."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    fm = head.split("\n---", 1)[0]
+    if re.search(r'^source:\s*"?' + re.escape(str(meeting_dir)) + r'"?\s*$', fm, re.MULTILINE):
+        return True
+    m = re.search(r"^aliases:\s*\[(.*)\]\s*$", fm, re.MULTILINE)
+    return bool(m and f'"{base}"' in m.group(1))
+
+
+def claim_note_path(vault: Path, stem: str, meeting_dir: Path, base: str,
+                    start_time: str) -> tuple[str, Path]:
+    """Pick a note name that is either free or already ours."""
+    candidates = [stem]
+    if start_time:
+        candidates.append(f"{stem} {start_time.replace(':', '-')}")
+    candidates.append(f"{stem} ({base})")
+    for cand in candidates:
+        name = safe_filename(cand)
+        path = vault / "Meetings" / f"{name}.md"
+        if not path.exists() or note_belongs_to(path, meeting_dir, base):
+            return name, path
+    name = safe_filename(f"{stem} ({base})")
+    return name, vault / "Meetings" / f"{name}.md"
+
+
+def existing_note_names(vault: Path) -> set[str]:
+    names: set[str] = set()
+    for p in vault.rglob("*.md"):
+        if ".obsidian" in p.parts or ".trash" in p.parts:
+            continue
+        names.add(norm(p.stem))
+    return names
+
+
+def write_stub(vault: Path, existing: set[str], name: str, etype: str, meeting_link: str) -> bool:
+    """Create a stub note for a linked entity. NEVER overwrites: the user may
+    have written this note themselves."""
+    if norm(name) in existing:
+        return False
+    folder = "People" if etype == "person" else "Topics"
+    path = vault / folder / f"{safe_filename(name)}.md"
+    if path.exists():
+        existing.add(norm(name))
+        return False
+    body = (
+        "---\n"
+        f"type: {etype}\n"
+        f"aliases: [{yaml_str(name)}]\n"
+        f"tags: [{etype}, stub]\n"
+        "---\n\n"
+        f"# {name}\n\n"
+        "> Stub created automatically by the meeting pipeline. Edit freely — it will never be overwritten.\n\n"
+        "## Meetings\n\n"
+        f"- {meeting_link}\n"
+    )
+    atomic_write(path, body)
+    existing.add(norm(name))
+    return True
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    meeting_dir = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MEETING_DIR", "")).expanduser()
+    if not meeting_dir.is_dir():
+        die(f"meeting dir not found: {meeting_dir}")
+
+    base = os.environ.get("MEETING_BASE") or meeting_dir.name
+    home = Path.home()
+    summary_path = Path(os.environ.get("MEETING_SUMMARY") or meeting_dir / f"{base}_summary.md")
+    txt_path = Path(os.environ.get("MEETING_TXT") or meeting_dir / f"{base}.txt")
+    srt_path = Path(os.environ.get("MEETING_SRT") or meeting_dir / f"{base}.srt")
+    mkv_path = Path(os.environ.get("MEETING_MKV") or meeting_dir / f"{base}.mkv")
+    meeting_root = Path(os.environ.get("MEETING_ROOT") or meeting_dir.parent)
+    tools = Path(os.environ.get("MEETING_TOOLS") or home / ".local/share/meeting-tools")
+    vault = Path(os.environ.get("OBSIDIAN_VAULT") or home / "Documents/Obsidian Vault")
+
+    if not summary_path.is_file():
+        die(f"summary not found: {summary_path}")
+
+    # ---------------- upstream output locations (paths only — no parsing yet) ----
+    cal_path = meeting_dir / f"{base}_calendar.json"
+    spk_path = meeting_dir / f"{base}_speakers.json"
+    ins_path = meeting_dir / f"{base}_insights.json"
+    chp_path = meeting_dir / f"{base}_chapters.json"
+    thread_paths = [
+        meeting_root / "_threads.json",
+        tools / "threads/_threads.json",
+        tools / "threads.json",
+        meeting_dir / f"{base}_threads.json",
+    ]
+
+    # The calendar is the only upstream file needed to know the note's name, so
+    # it is the only one parsed before the idempotency check (README rule 6).
+    calendar = load_json(cal_path) or {}
+
+    # slides contact sheet — several plausible shapes
+    slides: Path | None = None
+    slide_globs = [
+        f"{base}_slides_contact*.*", f"{base}_slides.*", f"{base}_contact_sheet.*",
+        f"{base}_slides/contact*.*", "slides/contact*.*", f"{base}_slides/*.jpg",
+    ]
+    for pat in slide_globs:
+        hits = sorted(p for p in meeting_dir.glob(pat)
+                      if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".pdf"})
+        if hits:
+            slides = hits[0]
+            break
+
+    # ---------------- title / date / time ----------------
+    cal_title = text_of(calendar, "title", "summary", "event_title", "name") if isinstance(calendar, dict) else ""
+    m = re.match(r"(\d{4}-\d{2}-\d{2})[_ ](\d{2})-(\d{2})", base)
+    date = m.group(1) if m else ""
+    start_time = f"{m.group(2)}:{m.group(3)}" if m else ""
+    if not date and isinstance(calendar, dict):
+        cs = text_of(calendar, "start", "start_time", "starts_at")
+        if cs:
+            date = cs[:10]
+            tm = re.search(r"T(\d{2}:\d{2})", cs)
+            start_time = tm.group(1) if tm else start_time
+
+    title = cal_title
+    if not title:
+        tail = re.sub(r"^\d{4}-\d{2}-\d{2}[_ ]\d{2}-\d{2}[_ ]?", "", base).replace("_", " ").strip()
+        title = tail or "Meeting"
+    title = safe_filename(title)
+    note_name, note_path = claim_note_path(
+        vault, f"{date} {title}" if date else title, meeting_dir, base, start_time
+    )
+
+    # ---------------- IDEMPOTENCY (cheap: stat() only, no parsing) -------------
+    # The note is stale if ANY input is newer than it — not just the summary.
+    # Modules are added incrementally and the pipeline re-runs over every old
+    # meeting, so a note written before e.g. 10-chapters existed must pick the
+    # chapters up on the next pass instead of being frozen forever.
+    inputs = [summary_path, cal_path, spk_path, ins_path, chp_path, *thread_paths]
+    if slides:
+        inputs.append(slides)
+    newest = 0.0
+    for p in inputs:
+        try:
+            newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            pass
+    try:
+        if note_path.is_file() and note_path.stat().st_mtime >= newest:
+            log(f"note is current, nothing to do: {note_path}")
+            return 0
+    except OSError:
+        pass
+
+    # ---------------- remaining upstream outputs ----------------
+    speakers_raw = load_json(spk_path)
+    insights = load_json(ins_path) or {}
+    chapters_raw = load_json(chp_path)
+
+    threads_raw = None
+    for cand in thread_paths:
+        threads_raw = load_json(cand)
+        if threads_raw is not None:
+            break
+
+    # ---------------- duration ----------------
+    duration = ""
+    try:
+        if mkv_path.exists():
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(mkv_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                duration = hhmmss(float(out.stdout.strip()))
+    except Exception:  # noqa: BLE001 — ffprobe is a nicety, not a requirement
+        pass
+    if not duration and txt_path.is_file():
+        stamps = re.findall(r"\[(\d{2}:\d{2}:\d{2})\]", txt_path.read_text(encoding="utf-8", errors="replace"))
+        if stamps:
+            duration = stamps[-1]
+
+    # ---------------- people ----------------
+    vocab = Vocabulary(tools / "obsidian/entities.json")
+    people_raw: list[str] = []
+
+    for att in as_list(calendar, "attendees", "participants", "guests"):
+        n = text_of(att, "name", "displayName", "display_name", "email")
+        if n:
+            people_raw.append(n.split("@")[0].replace(".", " ").title() if "@" in n and " " not in n else n)
+
+    org = calendar.get("organizer") if isinstance(calendar, dict) else None
+    if org:
+        n = text_of(org, "name", "displayName", "email")
+        if n:
+            people_raw.append(n)
+
+    if isinstance(speakers_raw, dict) and not any(
+        isinstance(v, (list, dict)) for v in speakers_raw.values()
+    ):
+        people_raw.extend(str(v) for v in speakers_raw.values())  # {"SPEAKER_00": "Alice"}
+    for sp in as_list(speakers_raw, "speakers", "labels", "diarization"):
+        n = text_of(sp, "name", "speaker", "label", "display_name")
+        if n:
+            people_raw.append(n)
+
+    summary_md = summary_path.read_text(encoding="utf-8", errors="replace")
+    sections = split_sections(summary_md)
+
+    # Degraded fallback: no calendar and no speakers module yet, but the
+    # summary's action items name people ("- **Eric:** publish the dataset").
+    if not people_raw:
+        for mm in re.finditer(r"^\s*[-*]\s*\*\*([^*:]{2,40}?):?\*\*", summary_md, re.MULTILINE):
+            people_raw.append(mm.group(1))
+
+    people: list[str] = []
+    for p in people_raw:
+        c = vocab.resolve(p, "person")
+        if c and c not in people:
+            people.append(c)
+
+    # ---------------- topics: thread + jargon ----------------
+    thread_names: list[str] = []
+    if threads_raw is not None:
+        candidates = as_list(threads_raw, "threads")
+        if isinstance(threads_raw, dict) and not candidates:
+            for k, v in threads_raw.items():
+                members = v if isinstance(v, list) else (v.get("meetings", []) if isinstance(v, dict) else [])
+                if any(base in str(x) for x in members):
+                    thread_names.append(k)
+        for th in candidates:
+            if isinstance(th, str):
+                continue
+            name = text_of(th, "name", "thread", "title", "topic")
+            members = as_list(th, "meetings", "members", "meeting_ids", "bases")
+            if name and (not members or any(base in str(x) for x in members)):
+                thread_names.append(name)
+        # per-meeting shape: {"thread": "CRC atlas"}
+        n = text_of(threads_raw, "thread", "thread_name") if isinstance(threads_raw, dict) else ""
+        if n:
+            thread_names.append(n)
+
+    jargon_raw: list[str] = []
+    for key in ("jargon", "terms", "key_terms", "glossary", "topics", "entities", "keywords"):
+        for j in as_list(insights.get(key) if isinstance(insights, dict) else None, key):
+            t = text_of(j, "term", "name", "text", "topic", "keyword")
+            if t:
+                jargon_raw.append(t)
+
+    # A term mentioned in exactly one meeting is not a topic, it is a word.
+    # Linking every piece of jargon buried the vault under 117 orphan stubs for
+    # 9 real topics, so require a term to RECUR across meetings before it earns
+    # a note. Thread names are exempt — a thread is a topic by definition.
+    jargon_raw = [t for t in jargon_raw
+                  if term_meeting_count(t) >= MIN_TOPIC_MEETINGS]
+
+    topics: list[str] = []
+    for t in thread_names + jargon_raw:
+        c = vocab.resolve(t, "topic")
+        if c and c not in topics:
+            topics.append(c)
+
+    # alias -> canonical, for linkification
+    links: dict[str, str] = {}
+    for ent in vocab.entities:
+        if ent["canonical"] in people or ent["canonical"] in topics:
+            for alias in [ent["canonical"], *ent["aliases"]]:
+                if len(alias) >= 3 or ent["type"] == "person":
+                    links[alias.lower()] = ent["canonical"]
+
+    # ---------------- build the body ----------------
+    tldr = pick_section(sections, "tl dr", "tldr", "summary", "overview")
+    key_points = pick_section(sections, "key points", "highlights", "discussion")
+    decisions = pick_section(sections, "decisions", "decisions made")
+    actions = pick_section(sections, "action items", "actions", "next steps")
+    open_qs = pick_section(sections, "open questions", "questions")
+
+    parts: list[str] = [f"# {title}", ""]
+
+    if tldr:
+        parts += ["## TL;DR", "", tldr, ""]
+    for heading, content in (
+        ("Key points", key_points),
+        ("Decisions", decisions),
+        ("Action items", actions),
+        ("Open questions", open_qs),
+    ):
+        if content:
+            parts += [f"## {heading}", "", content, ""]
+
+    # chapters
+    chapters = as_list(chapters_raw, "chapters", "sections")
+    if chapters:
+        parts += ["## Chapters", ""]
+        for ch in chapters:
+            if isinstance(ch, str):
+                parts.append(f"- {ch}")
+                continue
+            secs = parse_clock(first_key(ch, "start", "start_time", "time", "timestamp", "t", "begin"))
+            ctitle = text_of(ch, "title", "name", "label", "heading", "topic") or "(untitled)"
+            csum = text_of(ch, "summary", "description", "text", "detail")
+            stamp = f"`{hhmmss(secs)}` " if secs is not None else ""
+            parts.append(f"- {stamp}**{ctitle}**" + (f" — {csum}" if csum else ""))
+        parts.append("")
+
+    # unanswered questions from insights
+    unanswered: list[str] = []
+    for key in ("unanswered_questions", "open_questions", "unanswered", "questions"):
+        for q in as_list(insights.get(key) if isinstance(insights, dict) else None, key):
+            t = text_of(q, "question", "text", "q", "content")
+            if not t:
+                continue
+            if isinstance(q, dict):
+                status = str(first_key(q, "status", "answered", "resolved") or "").lower()
+                if status in ("answered", "true", "resolved", "yes"):
+                    continue
+            unanswered.append(t)
+        if unanswered:
+            break
+    if unanswered:
+        parts += ["## Unanswered questions", ""]
+        parts += [f"- {q}" for q in unanswered]
+        parts.append("")
+
+    if slides:
+        parts += ["## Slides", "", f"[Contact sheet]({file_url(slides)})", ""]
+
+    parts += ["## Transcript", ""]
+    if txt_path.is_file():
+        parts.append(f"- [Speaker-labelled transcript]({file_url(txt_path)})")
+    if srt_path.is_file() and srt_path.stat().st_size > 0:
+        parts.append(f"- [Subtitles (SRT)]({file_url(srt_path)})")
+    if mkv_path.exists():
+        parts.append(f"- [Recording]({file_url(mkv_path)})")
+    parts.append(f"- [Meeting folder]({file_url(meeting_dir)})")
+    parts.append("")
+
+    body = linkify("\n".join(parts).rstrip(), links) + "\n"
+
+    # ---------------- frontmatter ----------------
+    fm: list[str] = ["---"]
+    if date:
+        fm.append(f"date: {date}")
+    if start_time:
+        fm.append(f"start_time: {yaml_str(start_time)}")
+    if duration:
+        fm.append(f"duration: {yaml_str(duration)}")
+    fm.append(f"source: {yaml_str(str(meeting_dir))}")
+    fm.append("type: meeting")
+
+    if people:
+        fm.append("participants:")
+        fm += [f"  - {yaml_str(f'[[{p}]]')}" for p in people]
+    else:
+        fm.append("participants: []")
+
+    if thread_names:
+        canon_threads = [vocab.resolve(t, "topic") or t for t in thread_names]
+        fm.append("thread:")
+        fm += [f"  - {yaml_str(f'[[{t}]]')}" for t in dict.fromkeys(canon_threads)]
+
+    if topics:
+        fm.append("topics:")
+        fm += [f"  - {yaml_str(f'[[{t}]]')}" for t in topics]
+
+    tags = ["meeting"]
+    if date:
+        tags.append(f"meeting/{date[:7]}")
+    for t in thread_names:
+        slug = re.sub(r"[^a-z0-9]+", "-", norm(t)).strip("-")
+        if slug:
+            tags.append(f"thread/{slug}")
+    fm.append("tags: [" + ", ".join(tags) + "]")
+
+    aliases = [a for a in dict.fromkeys([base, title]) if a and a != note_name]
+    fm.append("aliases: [" + ", ".join(yaml_str(a) for a in aliases) + "]")
+    fm.append("---")
+    frontmatter = "\n".join(fm)
+
+    # ---------------- preserve the user's own notes ----------------
+    user_block = f"{USER_MARKER}\n\n<!-- Your notes below this line are preserved across regenerations. -->\n"
+    if note_path.is_file():
+        old = note_path.read_text(encoding="utf-8", errors="replace")
+        idx = old.find(f"\n{USER_MARKER}")
+        if idx == -1 and old.startswith(USER_MARKER):
+            idx = 0
+        if idx != -1:
+            kept = old[idx:].lstrip("\n")
+            if kept.strip() != USER_MARKER:
+                user_block = kept.rstrip() + "\n"
+
+    note = f"{frontmatter}\n\n{body}\n{user_block}"
+
+    # ---------------- write ----------------
+    atomic_write(note_path, note)
+    log(f"wrote {note_path}")
+
+    existing = existing_note_names(vault)
+    meeting_link = f"[[{note_name}]]"
+    stubs = 0
+    for name in people:
+        stubs += write_stub(vault, existing, name, "person", meeting_link)
+    for name in topics:
+        stubs += write_stub(vault, existing, name, "topic", meeting_link)
+    vocab.save()
+
+    log(f"people={len(people)} topics={len(topics)} stubs_created={stubs} "
+        f"chapters={len(chapters)} slides={'yes' if slides else 'no'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,316 @@
+#!/bin/bash
+# 30-insights — structured extraction from a meeting transcript via `claude -p`.
+#
+# Outputs:
+#   <MEETING_DIR>/<base>_insights.json
+#   <MEETING_DIR>/<base>_insights.md   (unanswered questions to "You" first)
+#
+# Contract: see ../meeting-modules/README.md. Idempotent, fail-soft, no prompts.
+
+set -uo pipefail
+
+MEETING_DIR="${1:-${MEETING_DIR:-}}"
+if [ -z "$MEETING_DIR" ] || [ ! -d "$MEETING_DIR" ]; then
+  echo "30-insights: usage: $0 <MEETING_DIR>" >&2
+  exit 2
+fi
+
+# Derive anything the orchestrator did not export (also lets us run standalone).
+if [ -z "${MEETING_BASE:-}" ]; then
+  MEETING_BASE="$(basename "$MEETING_DIR")"
+fi
+MEETING_TXT="${MEETING_TXT:-$MEETING_DIR/$MEETING_BASE.txt}"
+MEETING_SUMMARY="${MEETING_SUMMARY:-$MEETING_DIR/${MEETING_BASE}_summary.md}"
+
+JSON_OUT="$MEETING_DIR/${MEETING_BASE}_insights.json"
+MD_OUT="$MEETING_DIR/${MEETING_BASE}_insights.md"
+
+# Rule 1 + 6: cheapest possible idempotency check, before any work.
+if [ -s "$JSON_OUT" ] && [ -s "$MD_OUT" ]; then
+  echo "30-insights: already done ($(basename "$JSON_OUT")) — skipping"
+  exit 0
+fi
+
+if [ ! -s "$MEETING_TXT" ]; then
+  echo "30-insights: no transcript at $MEETING_TXT" >&2
+  exit 1
+fi
+
+# Resolve the claude CLI. meeting-process appends $HOME/.local/bin to PATH, but do not
+# rely on the caller's PATH — fall back to the known install location.
+CLAUDE_BIN="$(command -v claude 2>/dev/null)"
+if [ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+fi
+if [ -z "$CLAUDE_BIN" ]; then
+  echo "30-insights: claude CLI not found (PATH or ~/.local/bin)" >&2
+  exit 1
+fi
+
+# Bound the LLM call so a hung `claude -p` can never wedge the unattended pipeline
+# (README rule 5). `timeout` is optional — degrade to an unbounded call if absent.
+TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)"
+CLAUDE_TIMEOUT="${INSIGHTS_TIMEOUT:-600}"
+
+run_claude() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$CLAUDE_TIMEOUT" "$CLAUDE_BIN" -p
+  else
+    "$CLAUDE_BIN" -p
+  fi
+}
+
+TMPDIR_ME="$(mktemp -d "${TMPDIR:-/tmp}/30-insights.XXXXXX")" || exit 1
+trap 'rm -rf "$TMPDIR_ME"' EXIT INT TERM
+
+RAW="$TMPDIR_ME/raw.txt"
+JSON_TMP="$TMPDIR_ME/insights.json"
+MD_TMP="$TMPDIR_ME/insights.md"
+
+read -r -d '' PROMPT <<'EOP'
+You are extracting structured facts from a meeting transcript. The transcript is a
+scientific / bioinformatics lab meeting. Lines look like:
+
+    [00:01:47] Participants: And so, okay, two weeks.
+    [00:01:57] You: When?
+
+"You" is the person who recorded the meeting (their microphone). "Participants" is
+everyone else (one merged system-audio track — you cannot tell those speakers apart,
+so attribute them as "Participants" unless the transcript names someone explicitly).
+
+Output ONE JSON object and nothing else. No prose, no markdown fences. Schema:
+
+{
+  "questions_to_you": [
+    {
+      "question": "the question, quoted or closely paraphrased",
+      "asked_by": "Participants" or a name if the transcript names the asker,
+      "timestamp": "HH:MM:SS of the question",
+      "answered": true | false,
+      "answer_timestamp": "HH:MM:SS of the 'You' line that answers it, or null",
+      "answer": "one line of what You actually said in reply, or null"
+    }
+  ],
+  "decisions":    [{"decision": "...", "who_agreed": "...", "timestamp": "HH:MM:SS"}],
+  "commitments":  [{"who": "...", "what": "...", "timestamp": "HH:MM:SS"}],
+  "deadlines":    [{"what": "...", "when": "the date/deadline as stated", "timestamp": "HH:MM:SS"}],
+  "jargon":       [{"term": "...", "gloss": "one line, inferred from how it is used here", "timestamp": "HH:MM:SS"}],
+  "numbers":      [{"value": "the figure as stated", "refers_to": "what it quantifies", "timestamp": "HH:MM:SS"}]
+}
+
+Rules — follow exactly:
+- EVERY item must be grounded in a specific transcript line and carry that line's
+  timestamp. Never invent, extrapolate, or infer beyond what was said.
+- questions_to_you — WORK THIS ONE CAREFULLY, it is the most important field:
+  Scan EVERY "Participants" line containing a question mark. Treat each one as a
+  question addressed to You (the recorder) and INCLUDE it, unless it is clearly one of:
+    (a) an audio/screen-share check — "can you hear me?", "did that come up?";
+    (b) thinking aloud — the SAME speaker answers it himself within the next line or
+        two ("How many RPSs are there?" / "Oops, not very many.");
+    (c) purely rhetorical, where no reply is possible or expected.
+  Borderline, tag-style questions ("...right?", "...isn't it?", "are we done with
+  that?") ARE directed at You — include them. Do not return an empty list just to be
+  safe: a genuine question that you drop is a real loss to the user.
+
+  Then decide "answered" by reading the "You" lines that follow the question:
+    * A BACKCHANNEL IS NOT AN ANSWER. "Mm-hmm", "Okay", "Yeah", "Great", "Thanks",
+      "Right", laughter, or silence => answered=false, even though You spoke.
+    * answered=true only if You supplied actual content the question asked for
+      (a number, a fact, a yes/no with substance, a decision).
+    * If the conversation just moves on, or a Participant talks over it =>
+      answered=false.
+  When in doubt about whether it was ANSWERED, choose false. (When in doubt about
+  whether to INCLUDE the question at all, include it.)
+- jargon: domain terms and acronyms (genes, assays, tools, clustering resolutions,
+  journals, etc.). Gloss from context only; if you cannot tell what it means from the
+  transcript, say so plainly in the gloss rather than guessing.
+- numbers: specific figures/quantities that were stated (counts, sizes, money, dates
+  used as quantities, resolutions, p-values...). Skip timestamps themselves.
+- Any category with nothing grounded in the transcript must be an empty array [].
+  An empty array is a correct answer. Padding it with guesses is a failure.
+
+The transcript follows.
+EOP
+
+echo "30-insights: extracting insights for $MEETING_BASE (this can take a minute)..."
+
+# Retry once — `claude -p` occasionally wraps or chats around the JSON.
+attempt=1
+ok=0
+while [ "$attempt" -le 2 ]; do
+  {
+    printf '%s\n\n=== TRANSCRIPT: %s ===\n\n' "$PROMPT" "$MEETING_BASE"
+    cat "$MEETING_TXT"
+  } > "$TMPDIR_ME/prompt.txt"
+
+  if [ "$attempt" -eq 2 ]; then
+    printf '\n\nREMINDER: reply with the raw JSON object ONLY. No fences, no commentary.\n' \
+      >> "$TMPDIR_ME/prompt.txt"
+  fi
+
+  # Feed the prompt on stdin, not argv: a long transcript as a command-line argument
+  # blows past ARG_MAX (~1MB) and exec fails outright.
+  if run_claude < "$TMPDIR_ME/prompt.txt" > "$RAW" 2>"$TMPDIR_ME/err.txt"; then
+    # Strip any ``` fences / leading chatter, keep the outermost {...} block, validate.
+    if python3 - "$RAW" "$JSON_TMP" <<'PY'
+import json, re, sys
+
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+raw = re.sub(r"^\s*```(?:json)?|```\s*$", "", raw.strip(), flags=re.M)
+i, j = raw.find("{"), raw.rfind("}")
+if i == -1 or j <= i:
+    sys.exit("no JSON object in model output")
+try:
+    data = json.loads(raw[i:j + 1])
+except json.JSONDecodeError as e:
+    sys.exit(f"invalid JSON: {e}")
+if not isinstance(data, dict):
+    sys.exit("top level is not an object")
+
+KEYS = ["questions_to_you", "decisions", "commitments", "deadlines", "jargon", "numbers"]
+
+# Reject output that only *looks* like JSON. Silently coercing a schema violation to
+# empty arrays would write an all-empty insights file and exit 0 — and because the
+# module is idempotent, that dud is then never retried. Fail instead, so the next
+# pipeline run gets another shot. A well-formed response whose arrays are genuinely
+# all empty is still accepted: that is a legitimate answer.
+present = {k: data[k] for k in KEYS if k in data}
+if not present:
+    sys.exit("model JSON has none of the expected keys")
+mistyped = sorted(k for k, v in present.items() if not isinstance(v, list))
+if mistyped:
+    sys.exit(f"expected a list for: {', '.join(mistyped)}")
+
+out = {k: [x for x in data.get(k, []) if isinstance(x, dict)] for k in KEYS}
+
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump(out, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    then
+      ok=1
+      break
+    fi
+    echo "30-insights: attempt $attempt produced unusable output, retrying..." >&2
+  else
+    echo "30-insights: claude -p failed on attempt $attempt: $(head -c 400 "$TMPDIR_ME/err.txt")" >&2
+  fi
+  attempt=$((attempt + 1))
+done
+
+if [ "$ok" -ne 1 ]; then
+  echo "30-insights: could not obtain valid insights JSON — leaving no output" >&2
+  exit 1
+fi
+
+# Render the markdown. Unanswered questions to You lead the document.
+python3 - "$JSON_TMP" "$MD_TMP" "$MEETING_BASE" <<'PY'
+import json, sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+base = sys.argv[3]
+L = []
+
+
+def s(item, *keys, default=""):
+    """First non-empty stringified value among keys."""
+    for k in keys:
+        v = item.get(k)
+        if v not in (None, "", []):
+            return str(v).strip()
+    return default
+
+
+def ts(item, key="timestamp"):
+    t = s(item, key)
+    return f"`[{t}]`" if t else "`[--:--:--]`"
+
+
+def by_time(items):
+    """Chronological; items with no/odd timestamp sort last, original order kept."""
+    def key(pair):
+        i, it = pair
+        parts = s(it, "timestamp").split(":")
+        if len(parts) == 3 and all(p.strip().isdigit() for p in parts):
+            h, m, sec = (int(p) for p in parts)
+            return (0, h * 3600 + m * 60 + sec, i)
+        return (1, 0, i)
+    return [it for _, it in sorted(enumerate(items), key=key)]
+
+
+qs = data["questions_to_you"]
+unanswered = by_time([q for q in qs if not q.get("answered")])
+answered = by_time([q for q in qs if q.get("answered")])
+
+L.append(f"# Insights — {base}\n")
+
+L.append("## ⚠︎ Unanswered questions directed at you\n")
+if unanswered:
+    for q in unanswered:
+        who = s(q, "asked_by", default="Participants")
+        L.append(f"- {ts(q)} **{who} asked:** {s(q, 'question')}")
+    L.append("")
+else:
+    L.append("_None — every question put to you got a substantive answer._\n")
+
+if answered:
+    L.append("## Questions to you (answered)\n")
+    for q in answered:
+        who = s(q, "asked_by", default="Participants")
+        line = f"- {ts(q)} **{who}:** {s(q, 'question')}"
+        ans = s(q, "answer")
+        if ans:
+            line += f"\n  - {ts(q, 'answer_timestamp')} **You:** {ans}"
+        L.append(line)
+    L.append("")
+
+
+def section(title, key, fmt):
+    items = data.get(key, [])
+    L.append(f"## {title}\n")
+    if not items:
+        L.append("_None found in the transcript._\n")
+        return
+    for it in by_time(items):
+        L.append(fmt(it))
+    L.append("")
+
+
+section("Decisions", "decisions",
+        lambda d: f"- {ts(d)} {s(d, 'decision')}"
+                  + (f" — _agreed by {s(d, 'who_agreed')}_" if s(d, "who_agreed") else ""))
+
+section("Commitments", "commitments",
+        lambda c: f"- {ts(c)} **{s(c, 'who', default='?')}:** {s(c, 'what')}")
+
+section("Deadlines", "deadlines",
+        lambda d: f"- {ts(d)} **{s(d, 'when', default='?')}** — {s(d, 'what')}")
+
+section("Jargon", "jargon",
+        lambda j: f"- **{s(j, 'term')}** — {s(j, 'gloss')} {ts(j)}")
+
+section("Numbers", "numbers",
+        lambda n: f"- **{s(n, 'value')}** — {s(n, 'refers_to')} {ts(n)}")
+
+L.append("---\n")
+L.append("_Extracted from the transcript by `30-insights`. Every item is timestamped;"
+         " check the transcript if something looks off._")
+
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(L) + "\n")
+PY
+
+if [ $? -ne 0 ] || [ ! -s "$MD_TMP" ]; then
+  echo "30-insights: markdown rendering failed" >&2
+  exit 1
+fi
+
+# Rule 3: never leave a half-written output behind — mv into place, JSON last so the
+# idempotency check can never see a partial pair.
+mv "$MD_TMP" "$MD_OUT" && mv "$JSON_TMP" "$JSON_OUT" || {
+  echo "30-insights: could not install outputs into $MEETING_DIR" >&2
+  exit 1
+}
+
+nq=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for q in d["questions_to_you"] if not q.get("answered")))' "$JSON_OUT")
+echo "30-insights: wrote $(basename "$JSON_OUT") and $(basename "$MD_OUT") ($nq unanswered question(s) to you)"
+exit 0

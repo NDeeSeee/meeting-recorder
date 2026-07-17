@@ -1,0 +1,41 @@
+# ── Recordings & meeting data (NEVER commit) ──────────────────────────────
+# Raw recordings and everything derived from meeting content stays local.
+Recordings/
+*.mkv
+*.mp4
+*.srt
+*.wav
+
+# ── Models & weights (multi-GB, download separately — see docs/SETUP.md) ───
+*.bin
+*.pt
+*.pth
+*.safetensors
+whisper/
+models/
+
+# ── Python virtualenvs & caches ───────────────────────────────────────────
+venv/
+.venv/
+__pycache__/
+*.pyc
+hf/
+.cache/
+
+# ── Compiled binaries (built from source — see docs/SETUP.md) ─────────────
+tools/calendar/calquery          # build: swiftc calquery.swift -o calquery
+bin/audio-output-active          # prebuilt Swift helper; source not tracked
+
+# ── Local runtime state & derived indexes (regenerable, may contain PII) ──
+# These live under ~/.local/share/meeting-tools/ at runtime and are NOT
+# part of the source. Listed here as a reminder of what must never be added.
+index/vectors.npy
+index/meta.json
+index/state.json
+route/projects.json              # private project inventory
+obsidian/entities.json           # extracted people / PII
+actions/pushed.json
+*.log
+
+# ── macOS ─────────────────────────────────────────────────────────────────
+.DS_Store

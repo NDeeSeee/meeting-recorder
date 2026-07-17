@@ -1,0 +1,171 @@
+#!/bin/bash
+# meeting-name-speaker <meeting-dir> "Speaker 2" "Bob"
+#
+# Records the human name for a diarized cluster and stores that cluster's voice
+# centroid in $MEETING_TOOLS/speakers/voices.json, so the same person is named
+# automatically in every future meeting (see the 50-speakers module).
+#
+#   meeting-name-speaker --list <meeting-dir>     show current speakers
+#   meeting-name-speaker --voices                 show known voices
+
+set -uo pipefail
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+PY="$MEETING_TOOLS/speakers/venv/bin/python"
+[ -x "$PY" ] || PY="$(command -v python3)"
+[ -x "$PY" ] || { echo "no python available" >&2; exit 1; }
+
+usage() {
+    echo 'usage: meeting-name-speaker <meeting-dir> "Speaker N" "Real Name"' >&2
+    echo '       meeting-name-speaker --list <meeting-dir>' >&2
+    echo '       meeting-name-speaker --voices' >&2
+    exit 2
+}
+
+MODE="set"; DIR=""; SPK=""; NAME=""
+case "${1:-}" in
+    --voices) MODE="voices" ;;
+    --list)   MODE="list"; DIR="${2:-}"; [ -n "$DIR" ] || usage ;;
+    -h|--help|"") usage ;;
+    *)  DIR="$1"; SPK="${2:-}"; NAME="${3:-}"
+        [ -n "$SPK" ] && [ -n "$NAME" ] || usage ;;
+esac
+
+export MEETING_TOOLS MODE DIR SPK NAME
+
+"$PY" - <<'PYEOF'
+import json, os, re, sys, glob
+
+TOOLS  = os.path.join(os.environ["MEETING_TOOLS"], "speakers")
+VOICES = os.path.join(TOOLS, "voices.json")
+MODE   = os.environ["MODE"]
+DIR    = os.environ.get("DIR", "")
+SPK    = os.environ.get("SPK", "")
+NAME   = os.environ.get("NAME", "")
+
+
+def load_voices():
+    if os.path.isfile(VOICES):
+        try:
+            return json.load(open(VOICES))
+        except Exception:
+            pass
+    return {"voices": []}
+
+
+def save_voices(v):
+    os.makedirs(TOOLS, exist_ok=True)
+    tmp = VOICES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(v, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, VOICES)
+
+
+if MODE == "voices":
+    v = load_voices()["voices"]
+    if not v:
+        print("no known voices yet (%s)" % VOICES)
+    for x in v:
+        print("%-20s  (%d meeting(s), %d-dim centroid)"
+              % (x["name"], x.get("n_updates", 1), len(x["centroid"])))
+    sys.exit(0)
+
+if not os.path.isdir(DIR):
+    sys.exit("not a meeting dir: %s" % DIR)
+cands = sorted(glob.glob(os.path.join(DIR, "*_speakers.json")))
+if not cands:
+    sys.exit("no *_speakers.json in %s — run the 50-speakers module first" % DIR)
+SJ = cands[0]
+doc = json.load(open(SJ))
+base = doc["base"]
+DT = os.path.join(DIR, base + "_diarized.txt")
+
+if MODE == "list":
+    for s in doc["speakers"]:
+        print("%-10s  name=%-14s segments=%-4d %6.1fs%s"
+              % (s["id"], s["name"], s["n_segments"], s["total_seconds"],
+                 "" if s["named"] else "   <- unnamed"))
+    sys.exit(0)
+
+# --- set a name ---------------------------------------------------------------
+want = SPK.strip()
+target = None
+for s in doc["speakers"]:
+    if want.lower() in (s["id"].lower(), s["name"].lower()):
+        target = s
+        break
+if target is None:
+    sys.exit("no such speaker %r in %s (have: %s)"
+             % (SPK, os.path.basename(SJ), ", ".join(s["id"] for s in doc["speakers"])))
+
+old = target["name"]
+target["name"] = NAME
+target["named"] = True
+
+# 1. relabel this meeting's segments
+for seg in doc["segments"]:
+    if seg["speaker_id"] == target["id"]:
+        seg["speaker"] = NAME
+
+tmp = SJ + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2, ensure_ascii=False)
+os.replace(tmp, SJ)
+
+# 2. rewrite the diarized transcript (label -> new name)
+if os.path.isfile(DT):
+    pat = re.compile(r"^(\[\d\d:\d\d:\d\d\] )%s: " % re.escape(old))
+    out = [pat.sub(r"\1%s: " % NAME.replace("\\", r"\\"), l.rstrip("\n"))
+           for l in open(DT, encoding="utf-8", errors="replace")]
+    tmp = DT + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, DT)
+
+# 3. remember the voice so future meetings auto-name this person
+v = load_voices()
+cent = target["centroid"]
+try:
+    import numpy as np
+    arr = np.asarray(cent, dtype=np.float64)
+    arr = arr / (np.linalg.norm(arr) or 1.0)
+    cent = [round(float(x), 6) for x in arr]
+except Exception:
+    pass
+src = os.path.basename(os.path.abspath(DIR))
+entry = next((x for x in v.get("voices", [])
+              if isinstance(x, dict) and str(x.get("name", "")).lower() == NAME.lower()), None)
+if entry is None:
+    v.setdefault("voices", []).append(
+        {"name": NAME, "centroid": cent, "n_updates": 1, "from": [src]})
+else:
+    seen = entry.get("from")
+    seen = list(seen) if isinstance(seen, list) else ([seen] if seen else [])
+    if src in seen:
+        # Re-naming within a meeting this voice was already learned from. Averaging
+        # the same centroid in again would inflate n_updates and, if the user is
+        # correcting a mis-naming, permanently bake the wrong cluster into the
+        # voice. Replace this meeting's contribution instead.
+        entry["centroid"] = cent
+    else:
+        # running average of the stored centroid, then re-normalise
+        try:
+            import numpy as np
+            n = max(1, int(entry.get("n_updates", 1)))
+            a = np.asarray(entry["centroid"], dtype=np.float64) * n + np.asarray(cent, dtype=np.float64)
+            a = a / (np.linalg.norm(a) or 1.0)
+            entry["centroid"] = [round(float(x), 6) for x in a]
+            entry["n_updates"] = n + 1
+        except Exception:
+            entry["centroid"] = cent
+            entry["n_updates"] = int(entry.get("n_updates", 1)) + 1
+        seen.append(src)
+    entry["from"] = seen
+    entry["n_updates"] = len(seen)
+save_voices(v)
+
+print("%s: %s -> %s" % (os.path.basename(DIR), old, NAME))
+print("updated %s" % os.path.basename(SJ))
+if os.path.isfile(DT):
+    print("updated %s" % os.path.basename(DT))
+print("voice stored in %s — %s will be recognised automatically in future meetings" % (VOICES, NAME))
+PYEOF

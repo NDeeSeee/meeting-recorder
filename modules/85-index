@@ -1,0 +1,192 @@
+#!/bin/zsh
+# 85-index — add this meeting's transcript to the persistent semantic search index.
+#
+# Chunks the speaker-labelled transcript into overlapping passages that keep
+# their timestamp + speaker, embeds them with sentence-transformers
+# (all-MiniLM-L6-v2), and appends them to a flat numpy vector index at
+# $MEETING_TOOLS/index/. Query it with `meeting-search`.
+#
+# Incremental: a meeting is re-embedded only if its transcript mtime changed.
+# Fail-soft: if the venv cannot be built (e.g. offline on first run) we log and
+# exit 0 — search is an extra, it must never break the pipeline.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+MEETING_DIR="${1:-${MEETING_DIR:-}}"
+[[ -n "$MEETING_DIR" && -d "$MEETING_DIR" ]] || { print -u2 "85-index: no meeting dir"; exit 1; }
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+MEETING_TXT="${MEETING_TXT:-}"
+if [[ -z "$MEETING_TXT" || ! -s "$MEETING_TXT" ]]; then
+    base="${MEETING_BASE:-${MEETING_DIR:t}}"
+    MEETING_TXT="$MEETING_DIR/$base.txt"
+fi
+[[ -s "$MEETING_TXT" ]] || { print -u2 "85-index: no transcript"; exit 1; }
+
+IDX="$MEETING_TOOLS/index"
+VENV="$IDX/venv"
+PY="$VENV/bin/python"
+STATE="$IDX/state.json"
+
+log() { print -r -- "85-index: $*"; }
+
+# --- cheap idempotency check (rule 6): already indexed at this mtime? --------
+mtime=$(/usr/bin/stat -f%m "$MEETING_TXT")
+if [[ -f "$STATE" && -f "$IDX/vectors.npy" ]]; then
+    cur=$(jq -r --arg d "$MEETING_DIR" '.[$d].mtime // empty' "$STATE" 2>/dev/null)
+    if [[ "$cur" == "$mtime" ]]; then
+        log "already indexed (${MEETING_DIR:t})"
+        exit 0
+    fi
+fi
+
+# --- lazy, one-time venv ----------------------------------------------------
+mkdir -p "$IDX" || exit 1
+if [[ ! -x "$PY" ]]; then
+    log "building embedding venv (first run, needs network)…"
+    if ! uv venv --python 3.12 "$VENV" >/dev/null 2>&1; then
+        log "WARN could not create venv — skipping semantic index"; exit 0
+    fi
+    if ! uv pip install --quiet --python "$PY" \
+            "sentence-transformers>=3,<6" "numpy>=1.26" >/dev/null 2>&1; then
+        log "WARN could not install sentence-transformers — skipping semantic index"
+        rm -rf "$VENV"; exit 0
+    fi
+fi
+
+# Keep the model (~90 MB) inside our own tools dir so it is self-contained and
+# works offline once downloaded.
+export HF_HOME="$IDX/hf"
+export TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_PROGRESS_BARS=1
+
+"$PY" - "$MEETING_DIR" "$MEETING_TXT" "$mtime" "$IDX" <<'PYEOF'
+import json, os, re, sys, tempfile, time
+import numpy as np
+
+meeting_dir, txt_path, mtime, idx = sys.argv[1:5]
+vec_path   = os.path.join(idx, "vectors.npy")
+meta_path  = os.path.join(idx, "meta.json")
+state_path = os.path.join(idx, "state.json")
+
+LINE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]\s*([^:]+):\s*(.*)$")
+
+lines = []
+with open(txt_path, encoding="utf-8", errors="replace") as fh:
+    for raw in fh:
+        m = LINE.match(raw.strip())
+        if not m:
+            continue
+        h, mm, s, spk, text = m.groups()
+        text = text.strip()
+        if not text:
+            continue
+        lines.append({"ts": f"{h}:{mm}:{s}", "sec": int(h)*3600+int(mm)*60+int(s),
+                      "speaker": spk.strip(), "text": text})
+
+if not lines:
+    print("85-index: transcript has no parseable lines; nothing to index")
+    sys.exit(0)
+
+# Overlapping passages: 6 lines wide, stride 3 -> every line appears in >=2
+# chunks, so a hit near a boundary still carries its neighbours as context.
+WIN, STRIDE = 6, 3
+last_start = max(len(lines) - WIN, 0)
+starts = list(range(0, last_start + 1, STRIDE))
+# The stride rarely lands exactly on the tail, so without this the final
+# 1..STRIDE-1 lines of every meeting would never be indexed at all.
+if starts[-1] != last_start:
+    starts.append(last_start)
+
+chunks = []
+for start in starts:
+    win = lines[start:start + WIN]
+    if not win:
+        continue
+    anchor = win[len(win) // 2]          # line the timestamp/quote points at
+    chunks.append({
+        "meeting": os.path.basename(os.path.normpath(meeting_dir)),
+        "dir": meeting_dir,
+        "ts": anchor["ts"],
+        "sec": anchor["sec"],
+        "speaker": anchor["speaker"],
+        "line": anchor["text"],
+        "context": [f"[{l['ts']}] {l['speaker']}: {l['text']}" for l in win],
+        "text": " ".join(f"{l['speaker']}: {l['text']}" for l in win),
+    })
+
+from transformers.utils import logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+from sentence_transformers import SentenceTransformer
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2",
+                            cache_folder=os.path.join(idx, "models"))
+emb = model.encode([c["text"] for c in chunks], normalize_embeddings=True,
+                   batch_size=64, show_progress_bar=False).astype("float32")
+
+def alive(d):
+    """Is this indexed meeting folder still on disk?
+
+    90-title renames MEETING_DIR after we run, so on the next pipeline pass the
+    same meeting arrives under a new path. Keyed only by path, its old rows
+    would linger forever: the meeting gets indexed twice and every search
+    returns each moment twice, once under a folder that no longer exists.
+    Guard on the parent so a missing/unmounted Meetings root (where *every* dir
+    looks gone) can never wipe the index instead of pruning it.
+    """
+    if not d:
+        return True
+    parent = os.path.dirname(os.path.normpath(d))
+    return os.path.isdir(d) or not os.path.isdir(parent)
+
+# Load existing index, drop previous chunks for THIS meeting (re-index) and any
+# meeting whose folder has since been renamed or deleted.
+if os.path.exists(vec_path) and os.path.exists(meta_path):
+    old_vecs = np.load(vec_path)
+    with open(meta_path, encoding="utf-8") as fh:
+        old_meta = json.load(fh)
+    keep = [i for i, m in enumerate(old_meta)
+            if m.get("dir") != meeting_dir and alive(m.get("dir"))]
+    old_vecs = old_vecs[keep] if keep else np.zeros((0, emb.shape[1]), "float32")
+    old_meta = [old_meta[i] for i in keep]
+else:
+    old_vecs = np.zeros((0, emb.shape[1]), "float32")
+    old_meta = []
+
+vecs = np.vstack([old_vecs, emb]) if len(old_meta) else emb
+meta = old_meta + chunks
+
+state = {}
+if os.path.exists(state_path):
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception:
+        state = {}
+state = {k: v for k, v in state.items() if k != meeting_dir and alive(k)}
+state[meeting_dir] = {"mtime": mtime, "chunks": len(chunks),
+                      "indexed": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+def atomic(path, writer):                 # rule 3: never a half-written file
+    fd, tmp = tempfile.mkstemp(dir=idx)
+    os.close(fd)
+    os.chmod(tmp, 0o644)
+    writer(tmp)
+    os.replace(tmp, path)
+
+def save_npy(p):        # pass a file object: np.save(path) would append ".npy"
+    with open(p, "wb") as fh:
+        np.save(fh, vecs, allow_pickle=False)
+
+def save_json(obj, indent=None):
+    def w(p):
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=indent)
+    return w
+
+atomic(vec_path, save_npy)
+atomic(meta_path, save_json(meta))
+atomic(state_path, save_json(state, indent=2))
+
+print(f"85-index: indexed {len(chunks)} passages from "
+      f"{os.path.basename(os.path.normpath(meeting_dir))} "
+      f"({len(meta)} passages / {len(state)} meetings total)")
+PYEOF

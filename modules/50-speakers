@@ -1,0 +1,384 @@
+#!/bin/bash
+# 50-speakers — speaker diarization of the participants track (audio a:2).
+#
+# Ungated pipeline: speechbrain ECAPA-TDNN embeddings + agglomerative clustering.
+# Segments come from the existing <base>.srt (no VAD re-run). Clusters are matched
+# against $MEETING_TOOLS/speakers/voices.json so a person named once (via
+# ~/.local/bin/meeting-name-speaker) is auto-named in every future meeting.
+#
+# Outputs: <base>_speakers.json, <base>_diarized.txt
+# Degrades gracefully (exit 0) if the venv/model cannot be built.
+
+set -uo pipefail
+
+MEETING_DIR="${1:-${MEETING_DIR:-}}"
+[ -n "$MEETING_DIR" ] && [ -d "$MEETING_DIR" ] || { echo "[speakers] no meeting dir" >&2; exit 1; }
+
+MEETING_BASE="${MEETING_BASE:-$(basename "$MEETING_DIR")}"
+MEETING_MKV="${MEETING_MKV:-$MEETING_DIR/$MEETING_BASE.mkv}"
+MEETING_TXT="${MEETING_TXT:-$MEETING_DIR/$MEETING_BASE.txt}"
+MEETING_SRT="${MEETING_SRT:-$MEETING_DIR/$MEETING_BASE.srt}"
+MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
+
+OUT_JSON="$MEETING_DIR/${MEETING_BASE}_speakers.json"
+OUT_TXT="$MEETING_DIR/${MEETING_BASE}_diarized.txt"
+
+# Rule 1/6: cheap idempotency check first.
+if [ -s "$OUT_JSON" ] && [ -s "$OUT_TXT" ]; then
+    echo "[speakers] already done: $OUT_JSON"
+    exit 0
+fi
+
+[ -s "$MEETING_TXT" ] || { echo "[speakers] no transcript, skipping" >&2; exit 0; }
+[ -s "$MEETING_SRT" ] || { echo "[speakers] no SRT (need segment timestamps), skipping" >&2; exit 0; }
+[ -f "$MEETING_MKV" ] || { echo "[speakers] no recording, skipping" >&2; exit 0; }
+
+TOOLDIR="$MEETING_TOOLS/speakers"
+VENV="$TOOLDIR/venv"
+PY="$VENV/bin/python"
+READY="$TOOLDIR/.venv-ready"
+mkdir -p "$TOOLDIR" || exit 1
+
+# --- lazy, once-only venv build (needs network the first time) -----------------
+if [ ! -f "$READY" ] || [ ! -x "$PY" ]; then
+    echo "[speakers] building venv (first run, needs network)..."
+    UV="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    [ -x "$UV" ] || { echo "[speakers] uv not found; skipping" >&2; exit 0; }
+    if ! "$UV" venv --python 3.12 "$VENV" >&2; then
+        echo "[speakers] could not create venv; skipping" >&2; exit 0
+    fi
+    if ! "$UV" pip install --python "$PY" -q \
+            torch torchaudio speechbrain scikit-learn numpy soundfile >&2; then
+        echo "[speakers] could not install deps (offline?); skipping" >&2; exit 0
+    fi
+    touch "$READY"
+fi
+
+export MEETING_DIR MEETING_BASE MEETING_MKV MEETING_TXT MEETING_SRT TOOLDIR OUT_JSON OUT_TXT
+
+"$PY" - <<'PYEOF'
+import json, os, re, subprocess, sys, tempfile, shutil
+from bisect import bisect_right
+
+DIR    = os.environ["MEETING_DIR"]
+BASE   = os.environ["MEETING_BASE"]
+MKV    = os.environ["MEETING_MKV"]
+TXT    = os.environ["MEETING_TXT"]
+SRT    = os.environ["MEETING_SRT"]
+TOOLS  = os.environ["TOOLDIR"]
+OUT_JSON = os.environ["OUT_JSON"]
+OUT_TXT  = os.environ["OUT_TXT"]
+
+MODEL_DIR  = os.path.join(TOOLS, "models", "ecapa")
+VOICES     = os.path.join(TOOLS, "voices.json")
+# cosine-distance threshold for splitting clusters within one meeting.
+# Tuned on a real 32-min call: ECAPA same-speaker distances sit ~0.3-0.7 and
+# cross-speaker ~0.8-1.0, so 0.75 separates without shattering one voice.
+CLUSTER_T  = float(os.environ.get("MEETING_SPEAKER_THRESHOLD", "0.75"))
+# cosine-similarity threshold for recognising a known voice across meetings
+MATCH_T    = float(os.environ.get("MEETING_SPEAKER_MATCH", "0.45"))
+MIN_DUR    = 0.7     # seconds — shorter utterances are assigned, not clustered
+MAX_DUR    = 15.0    # seconds of audio to embed per utterance
+MIN_CLUSTER_SEC  = 10.0   # a real speaker must have this much speech...
+MIN_CLUSTER_SEGS = 3      # ...and this many utterances; else fold into nearest
+
+os.environ.setdefault("HF_HOME", os.path.join(TOOLS, "hf"))
+if os.path.isfile(os.path.join(MODEL_DIR, "hyperparams.yaml")) and \
+   os.path.isfile(os.path.join(MODEL_DIR, "embedding_model.ckpt")):
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")   # model already cached -> work offline
+
+
+def log(m): print("[speakers] " + m, flush=True)
+
+
+def ts_to_sec(h, m, s, ms=0):
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+
+
+def parse_srt(path):
+    segs = []
+    pat = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d+)\s*-->\s*(\d+):(\d\d):(\d\d)[,.](\d+)")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        blocks = re.split(r"\n\s*\n", f.read())
+    for b in blocks:
+        lines = [l for l in b.strip().splitlines() if l.strip()]
+        if len(lines) < 2:
+            continue
+        m = pat.search(b)
+        if not m:
+            continue
+        g = m.groups()
+        start = ts_to_sec(g[0], g[1], g[2], g[3])
+        end = ts_to_sec(g[4], g[5], g[6], g[7])
+        text = " ".join(l.strip() for l in lines if not pat.search(l) and not l.strip().isdigit())
+        segs.append({"start": round(start, 3), "end": round(end, 3), "text": text.strip()})
+    return segs
+
+
+segs = parse_srt(SRT)
+if not segs:
+    log("no usable SRT segments; skipping")
+    sys.exit(0)
+log("%d participant segments from SRT" % len(segs))
+
+try:
+    import numpy as np
+    import torch
+    import soundfile as sf
+    from sklearn.cluster import AgglomerativeClustering
+    from speechbrain.inference.speaker import EncoderClassifier
+except Exception as e:                                     # deps broken -> fail soft
+    log("deps unavailable (%s); skipping" % e)
+    sys.exit(0)
+
+tmpdir = tempfile.mkdtemp(prefix="speakers.")
+try:
+    # ---- participants track (a:2) -> 16 kHz mono wav --------------------------
+    wav = os.path.join(tmpdir, "participants.wav")
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", MKV,
+         "-map", "0:a:2", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
+        capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(wav):
+        log("ffmpeg could not extract a:2 (%s); skipping" % r.stderr.strip()[:200])
+        sys.exit(0)
+    audio, sr = sf.read(wav, dtype="float32")
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    log("participants audio: %.1f s @ %d Hz" % (len(audio) / sr, sr))
+
+    # ---- ECAPA-TDNN embeddings (ungated model, no HF token) ------------------
+    try:
+        from speechbrain.utils.fetching import LocalStrategy
+        enc = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=MODEL_DIR,
+            run_opts={"device": "cpu"},
+            local_strategy=LocalStrategy.COPY_SKIP_CACHE,   # self-contained -> offline later
+        )
+    except Exception as e:
+        log("could not load ECAPA model (offline first run?): %s; skipping" % e)
+        sys.exit(0)
+
+    def drop_silence(c, sr):
+        """SRT cues can span long pauses; keep only the loud 20 ms frames."""
+        w = int(0.02 * sr)
+        n = len(c) // w
+        if n < 3:
+            return c
+        frames = c[:n * w].reshape(n, w)
+        e = np.abs(frames).max(axis=1)
+        kept = frames[e > max(0.02, 0.15 * float(e.max()))].reshape(-1)
+        return kept if len(kept) >= 0.5 * sr else c
+
+    embs, idx_embedded = [], []
+    for i, s in enumerate(segs):
+        a = int(s["start"] * sr)
+        b = min(int(s["end"] * sr), a + int(MAX_DUR * sr), len(audio))
+        chunk = audio[a:b]
+        if len(chunk) < MIN_DUR * sr:
+            continue
+        chunk = drop_silence(chunk, sr)
+        if len(chunk) < MIN_DUR * sr:
+            continue
+        with torch.no_grad():
+            e = enc.encode_batch(torch.from_numpy(chunk).unsqueeze(0)).squeeze().cpu().numpy()
+        n = np.linalg.norm(e)
+        if not np.isfinite(n) or n == 0:
+            continue
+        embs.append(e / n)
+        idx_embedded.append(i)
+    if not embs:
+        log("no segment long enough to embed; skipping")
+        sys.exit(0)
+    X = np.vstack(embs)
+    log("embedded %d/%d segments (%d-dim)" % (len(X), len(segs), X.shape[1]))
+
+    # ---- cluster (speaker count chosen automatically by distance threshold) ---
+    if len(X) == 1:
+        labels = np.zeros(1, dtype=int)
+    else:
+        labels = AgglomerativeClustering(
+            n_clusters=None, distance_threshold=CLUSTER_T,
+            metric="cosine", linkage="average").fit_predict(X)
+
+    # A real speaker needs enough speech; fold spurious micro-clusters (mostly
+    # backchannel "Okay." / crosstalk) into the nearest surviving voice.
+    edur = np.array([segs[i]["end"] - segs[i]["start"] for i in idx_embedded])
+    counts = {c: int((labels == c).sum()) for c in set(labels.tolist())}
+    secs = {c: float(edur[labels == c].sum()) for c in counts}
+    keep = [c for c in counts
+            if secs[c] >= MIN_CLUSTER_SEC and counts[c] >= MIN_CLUSTER_SEGS]
+    if not keep:
+        keep = [max(counts, key=lambda c: secs[c])]
+    cents = {}
+    for c in keep:
+        v = X[labels == c].mean(axis=0)
+        cents[c] = v / (np.linalg.norm(v) or 1.0)
+    for i, c in enumerate(labels):
+        if c not in cents:
+            labels[i] = max(cents, key=lambda k: float(X[i] @ cents[k]))
+    # recompute centroids after reassignment
+    cents = {}
+    for c in sorted(set(labels.tolist())):
+        v = X[labels == c].mean(axis=0)
+        cents[c] = v / (np.linalg.norm(v) or 1.0)
+
+    # order speakers by first appearance
+    order, seen = [], set()
+    for c in labels.tolist():
+        if c not in seen:
+            seen.add(c); order.append(c)
+    remap = {c: i for i, c in enumerate(order)}
+    inv_remap = {i: c for c, i in remap.items()}
+    log("found %d speaker cluster(s) on the participants track" % len(order))
+
+    # ---- assign every SRT segment (incl. too-short ones) ----------------------
+    seg_cluster = {}
+    for i, c in zip(idx_embedded, labels.tolist()):
+        seg_cluster[i] = remap[c]
+    for i, s in enumerate(segs):
+        if i not in seg_cluster:                       # too short to embed
+            near = min(range(len(idx_embedded)),
+                       key=lambda k: abs(segs[idx_embedded[k]]["start"] - s["start"]))
+            seg_cluster[i] = remap[labels[near]]
+
+    # ---- match clusters against known voices ---------------------------------
+    # voices.json is shared global state that accumulates across every meeting.
+    # A single malformed entry (hand-edit, partial write, or a centroid from a
+    # different embedding model) must never take the module down: validate each
+    # entry and skip the bad ones, rather than trusting the schema.
+    voices = {"voices": []}
+    if os.path.isfile(VOICES):
+        try:
+            voices = json.load(open(VOICES))
+        except Exception:
+            log("voices.json unreadable; ignoring")
+    if not isinstance(voices, dict):
+        log("voices.json has unexpected shape; ignoring")
+        voices = {"voices": []}
+    dim = X.shape[1]
+    known = []
+    for v in (voices.get("voices") or []):
+        if not isinstance(v, dict):
+            continue
+        nm = v.get("name")
+        try:
+            kv = np.asarray(v.get("centroid"), dtype=np.float32).reshape(-1)
+        except Exception:
+            kv = None
+        if (not isinstance(nm, str) or not nm.strip() or kv is None
+                or kv.size != dim or not bool(np.all(np.isfinite(kv)))):
+            log("skipping malformed voice entry %r in voices.json" % (nm,))
+            continue
+        known.append({"name": nm, "centroid": kv / (np.linalg.norm(kv) or 1.0)})
+    names, used = {}, set()
+    for c in order:
+        cid = remap[c]
+        best, bestsim = None, 0.0
+        for v in known:
+            if v["name"] in used:
+                continue
+            sim = float(cents[c] @ v["centroid"])
+            if sim > bestsim:
+                best, bestsim = v, sim
+        if best is not None and bestsim >= MATCH_T:
+            names[cid] = {"name": best["name"], "match": round(bestsim, 3)}
+            used.add(best["name"])
+            log("Speaker %d -> %s (known voice, cos=%.3f)" % (cid + 1, best["name"], bestsim))
+        else:
+            names[cid] = {"name": "Speaker %d" % (cid + 1), "match": round(bestsim, 3)}
+
+    # ---- speakers.json --------------------------------------------------------
+    dur = {cid: 0.0 for cid in names}
+    for i, s in enumerate(segs):
+        dur[seg_cluster[i]] += max(0.0, s["end"] - s["start"])
+    doc = {
+        "base": BASE,
+        "track": "a:2 (participants)",
+        "model": "speechbrain/spkrec-ecapa-voxceleb",
+        "cluster_threshold": CLUSTER_T,
+        "match_threshold": MATCH_T,
+        "n_speakers": len(order),
+        "speakers": [
+            {
+                "id": "Speaker %d" % (cid + 1),
+                "name": names[cid]["name"],
+                "named": names[cid]["name"] != "Speaker %d" % (cid + 1),
+                "voice_match": names[cid]["match"],
+                "n_segments": sum(1 for i in range(len(segs)) if seg_cluster[i] == cid),
+                "total_seconds": round(dur[cid], 1),
+                "centroid": [round(float(x), 6) for x in cents[inv_remap[cid]]],
+            }
+            for cid in sorted(names)
+        ],
+        "segments": [
+            {
+                "start": s["start"], "end": s["end"],
+                "speaker_id": "Speaker %d" % (seg_cluster[i] + 1),
+                "speaker": names[seg_cluster[i]]["name"],
+                "text": s["text"],
+            }
+            for i, s in enumerate(segs)
+        ],
+    }
+
+    # ---- diarized transcript ---------------------------------------------------
+    starts = [s["start"] for s in segs]
+    def label_for(t):
+        j = bisect_right(starts, t + 0.5) - 1        # segment starting at/just before t
+        if j < 0:
+            j = 0
+        return names[seg_cluster[j]]["name"]
+
+    lines_out = []
+    tpat = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]\s+Participants:\s?(.*)$")
+    n_rewritten = 0
+    with open(TXT, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            m = tpat.match(line)
+            if m:
+                t = ts_to_sec(m.group(1), m.group(2), m.group(3))
+                lines_out.append("[%s:%s:%s] %s: %s"
+                                 % (m.group(1), m.group(2), m.group(3), label_for(t), m.group(4)))
+                n_rewritten += 1
+            else:
+                lines_out.append(line)                # "You:" lines untouched
+
+    tmp_j = OUT_JSON + ".tmp"
+    tmp_t = OUT_TXT + ".tmp"
+    with open(tmp_j, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+    with open(tmp_t, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines_out) + "\n")
+    os.replace(tmp_j, OUT_JSON)
+    os.replace(tmp_t, OUT_TXT)
+    log("relabelled %d 'Participants' lines -> %s" % (n_rewritten, os.path.basename(OUT_TXT)))
+    for sp in doc["speakers"]:
+        log("  %s = %-14s %3d segs  %6.1f s" % (sp["id"], sp["name"], sp["n_segments"], sp["total_seconds"]))
+    unnamed = [s["id"] for s in doc["speakers"] if not s["named"]]
+    if unnamed:
+        log("name them with: meeting-name-speaker %r %r \"Their Name\"" % (DIR, unnamed[0]))
+finally:
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    # Rule 3: never leave a half-written output behind. os.replace() consumed
+    # these on the success path; on a crash mid-write they must not survive.
+    for t in (OUT_JSON + ".tmp", OUT_TXT + ".tmp"):
+        try:
+            os.unlink(t)
+        except OSError:
+            pass
+PYEOF
+rc=$?
+
+# Every *expected* condition above (no SRT, no a:2, deps missing, model missing)
+# already exits 0 from inside Python. A non-zero status here is therefore a real,
+# unexpected failure: report it so the orchestrator logs it instead of recording a
+# silent success with no output. No partial output can exist at this point.
+if [ "$rc" -ne 0 ]; then
+    echo "[speakers] diarization failed unexpectedly (exit $rc); no output written" >&2
+    exit "$rc"
+fi
+
+exit 0
