@@ -58,13 +58,19 @@ local function shq(s)
     return t
 end
 
+-- Append to the log without a banner — for state changes worth a record but not
+-- an interruption (e.g. confirming capture came back to life).
+local function log_line(message)
+    os.execute(string.format(
+        "date '+%%Y-%%m-%%d %%H:%%M:%%S' | tr -d '\\n' >> \"$HOME/Library/Logs/meeting-notify.log\"; echo ' %s' >> \"$HOME/Library/Logs/meeting-notify.log\"",
+        shq(message)))
+end
+
 local function notify(title, message, sound)
     os.execute(string.format(
         "/usr/bin/osascript -e 'display notification \"%s\" with title \"%s\" sound name \"%s\"' >/dev/null 2>&1 &",
         shq(message), shq(title), shq(sound)))
-    os.execute(string.format(
-        "date '+%%Y-%%m-%%d %%H:%%M:%%S' | tr -d '\\n' >> \"$HOME/Library/Logs/meeting-notify.log\"; echo ' %s' >> \"$HOME/Library/Logs/meeting-notify.log\"",
-        shq(message)))
+    log_line(message)
 end
 
 local function set_scene(name)
@@ -144,12 +150,14 @@ local SCK_RESTORE_MS  = 400       -- comfortably more than one video frame
 local SCK_VERIFY_MS   = 6000      -- SCK needs a moment to deliver a first frame
 local SCK_CYCLE_TICKS = 10        -- idle minutes between refreshes
 local SCK_STALE_TICKS = 25        -- idle minutes without proof before we warn
+local SCK_AWAY_SECS   = 120       -- input idle past this = stepped away, likely asleep
 
 local sck_pending   = nil         -- sources awaiting restore + verification
 local sck_deferred  = false       -- a restore parked because recording started
 local sck_idle_tick = 0           -- idle minutes since the last confirmed frame
 local sck_since_try = 0           -- idle minutes since the last refresh attempt
 local sck_broken    = false       -- the last refresh produced no frame
+local sck_was_away  = false       -- input was idle past SCK_AWAY_SECS last tick
 
 -- Both SCK sources, because one stream death kills both: every failure in the
 -- logs is a *pair* of stop lines, and the recording that follows has frozen
@@ -205,6 +213,30 @@ local function sck_touch(name)
     obs.obs_source_release(src)
 end
 
+-- The step that makes a rebuild actually stick. init_screen_stream re-filters the
+-- new SCStream against a *cached* shareable-content snapshot (sc->shareable_content)
+-- that nothing in the update/init path refreshes — so after a display-sleep death
+-- it re-references the same dead SCDisplay and delivers no frames. The snapshot is
+-- only rebuilt by the plugin's content_settings_changed callback, which fires from
+-- obs_properties_apply_settings. Applying the source's own settings back through
+-- its properties forces a fresh SCShareableContent enumeration; the plugin holds a
+-- semaphore across that async fetch, so the subsequent init blocks until the new
+-- snapshot has landed. (This is also why OBS's own "Restart Capture" only works
+-- after its Properties dialog has been opened — the dialog does this apply for you.)
+-- It blocks the caller briefly, so like every rebuild step it runs idle-only.
+local function sck_reenumerate(name)
+    local src = obs.obs_get_source_by_name(name)
+    if src == nil then return end
+    local settings = obs.obs_source_get_settings(src)
+    local props    = obs.obs_source_properties(src)
+    if props ~= nil and settings ~= nil then
+        obs.obs_properties_apply_settings(props, settings)
+    end
+    if props ~= nil then obs.obs_properties_destroy(props) end
+    if settings ~= nil then obs.obs_data_release(settings) end
+    obs.obs_source_release(src)
+end
+
 -- A rebuild resets the source's frame size to zero, and only a frame actually
 -- delivered by ScreenCaptureKit makes it non-zero again. So a still-zero width
 -- here means the new stream never started — the one case we must never let pass
@@ -213,14 +245,17 @@ end
 -- is caught downstream by the pipeline's own empty-track check.
 local function sck_verify()
     obs.timer_remove(sck_verify)
-    local dead, checked = {}, 0
+    local dead, checked, live_w, live_h = {}, 0, 0, 0
     for _, s in ipairs(sck_pending or {}) do
         if s.video then
             local src = obs.obs_get_source_by_name(s.name)
             if src ~= nil then
                 checked = checked + 1
-                if obs.obs_source_get_width(src) == 0 then
+                local w = obs.obs_source_get_width(src)
+                if w == 0 then
                     dead[#dead + 1] = s.name
+                else
+                    live_w, live_h = w, obs.obs_source_get_height(src)
                 end
                 obs.obs_source_release(src)
             end
@@ -228,17 +263,24 @@ local function sck_verify()
     end
     sck_pending = nil
     if #dead > 0 then
-        -- Edge-triggered: the next cycle retries anyway, so repeating the alert
-        -- every ten minutes all night would only teach you to ignore it.
+        -- No banner. A failed background rebuild almost always just means the
+        -- display is asleep — ScreenCaptureKit drops a sleeping display from its
+        -- list, so init cannot attach and logs "Invalid target display ID". This
+        -- is benign: it self-heals the moment you return and the display wakes
+        -- (verified). The one place a dead stream is worth shouting about is when
+        -- you actually go to record, which warn_if_capture_dead handles — and by
+        -- then the display is awake, so the advice is real. Log only, once.
         if not sck_broken then
-            notify("⚠︎ Screen capture DEAD",
-                   string.format("%s is not producing frames — restart OBS or this records wallpaper only",
-                                 table.concat(dead, ", ")),
-                   "Basso")
+            log_line(string.format("%s not producing frames (display asleep?) — will retry on wake",
+                                   table.concat(dead, ", ")))
         end
         sck_broken = true
     elseif checked > 0 then
         -- A real frame arrived: the only evidence worth clearing the alarm on.
+        -- Logged (no banner) so a recovery leaves a trace we can point at.
+        if sck_broken then
+            log_line(string.format("screen capture recovered — live %dx%d", live_w, live_h))
+        end
         sck_idle_tick, sck_broken = 0, false
     end
     -- checked == 0 means no display capture is configured at all. Claim nothing:
@@ -263,15 +305,20 @@ local function sck_restore()
 end
 
 -- Rebuild every SCK source, healthy or not. Cheaper in every sense than asking
--- which one died: no properties enumeration to stall on, no per-source failure
--- flag to be wrong about, and the audio stream gets repaired even though it
--- exposes no failure flag of its own.
+-- which one died: no per-source failure flag to be wrong about, and the audio
+-- stream gets repaired even though it exposes no failure flag of its own.
 local function sck_refresh()
     if sck_pending ~= nil then return end       -- one already in flight
     if obs.obs_frontend_recording_active() then return end
     local srcs = sck_sources()
     if #srcs == 0 then return end
     sck_pending = srcs
+    -- Refresh each source's shareable-content snapshot BEFORE rebuilding, so the
+    -- new stream is filtered against a live display and not the dead cached one.
+    -- Without this step the flip below rebuilds a stream that delivers no frames.
+    for _, s in ipairs(srcs) do
+        sck_reenumerate(s.name)
+    end
     -- Armed before the flips, so an error in them cannot strand sck_pending and
     -- leave show_cursor inverted with nothing scheduled to put it back.
     obs.timer_add(sck_restore, SCK_RESTORE_MS)
@@ -292,10 +339,26 @@ local function sck_health_check()
     if sck_pending ~= nil then return end
     sck_idle_tick = sck_idle_tick + 1
     sck_since_try = sck_since_try + 1
-    if sck_since_try >= SCK_CYCLE_TICKS then
+    -- The stream only dies when the display sleeps, and the display only sleeps
+    -- when you step away. So the instant you come back — mouse or keyboard after
+    -- a spell of idle — repair right then, rather than waiting out the rest of the
+    -- cycle. That heals capture within one tick of you sitting down, well before
+    -- you start a meeting, instead of up to ten minutes later.
+    local away = idle_seconds() > SCK_AWAY_SECS
+    local just_returned = sck_was_away and not away
+    sck_was_away = away
+    if just_returned or sck_since_try >= SCK_CYCLE_TICKS then
         sck_since_try = 0
         sck_refresh()
     end
+end
+
+-- One-shot, fired a moment after load so OBS has settled. Reloading the script
+-- (Tools ▸ Scripts ▸ ↻) therefore repairs a stream that died since launch without
+-- a full restart, instead of waiting out the first idle cycle. Removes itself.
+local function sck_boot()
+    obs.timer_remove(sck_boot)
+    sck_refresh()
 end
 
 -- A dead capture costs the entire visual record — unrecoverable, unlike the
@@ -303,6 +366,7 @@ end
 -- banner that is easy to miss mid-meeting. "Not confirmed in a long while"
 -- counts as suspect too, because silence is exactly how nine meetings were lost.
 local function warn_if_capture_dead()
+    if sck_pending ~= nil then return end       -- a repair is mid-flight; let it finish
     if not (sck_broken or sck_idle_tick > SCK_STALE_TICKS) then return end
     notify("⚠︎ Screen capture suspect", "Video may be frozen wallpaper — restart OBS", "Basso")
     os.execute(
@@ -407,9 +471,20 @@ local function on_event(event)
         end
         -- Leave Idle so the capture sources are rendered for this recording.
         set_scene("Meeting")
-        -- Deliberately no repair attempt here, for the same reason. The idle
-        -- check has had minutes to fix this; if it could not, warn loudly and
-        -- let the recording proceed rather than risk having no recording.
+        -- Unlike the background case, the display is provably awake right now —
+        -- you are here starting a meeting — so a rebuild WILL find it and succeed
+        -- (the overnight failures were all "display asleep", never a wedged SCK).
+        -- If capture is currently down, e.g. you woke the machine and hit record
+        -- before the idle check healed it, repair now so the recording recovers
+        -- within seconds rather than being wallpaper the whole meeting. The flip's
+        -- init is deferred to the video thread and its cursor-restore self-defers
+        -- until the recording stops, so nothing blocks the encoder.
+        if sck_pending == nil and (sck_broken or sck_idle_tick > SCK_STALE_TICKS) then
+            log_line("capture down at record start — repairing (first seconds may be blank)")
+            sck_refresh()
+        end
+        -- Only fires if the above did not kick a repair (warn returns early while
+        -- one is in flight): a genuine, unrepairable-looking failure at record time.
         warn_if_capture_dead()
         warn_if_bluetooth_output()
 
@@ -446,6 +521,9 @@ function script_load(settings)
     -- Without this the staleness clause would fire a false alarm on any
     -- recording started before the first refresh cycle completes.
     sck_idle_tick, sck_since_try, sck_broken = 0, 0, false
+    -- Heal a stream that died before this script came up (e.g. an in-place
+    -- reload while the stream was already dead), rather than waiting a cycle.
+    obs.timer_add(sck_boot, 2000)
     -- Catch up on recordings left unprocessed (e.g. after an OBS crash).
     run_pipeline()
 end
