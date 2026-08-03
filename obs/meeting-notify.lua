@@ -13,16 +13,22 @@
 -- 5. Rebuilds the macOS ScreenCaptureKit streams when they die, which otherwise
 --    silently turns every later recording into frozen wallpaper with a digitally
 --    silent system-audio track.
+-- 6. Writes a heartbeat file every tick so bin/obs-watchdog (a separate launchd
+--    agent) can tell this script is still alive. Necessary because step 5's
+--    rebuild can block this thread forever on a stuck macOS semaphore — see the
+--    comment on write_heartbeat() — and nothing inside a frozen Lua VM can
+--    notice or recover from that itself.
 
 local obs = obslua
 
-local ANSWER_FILE   = "/tmp/meeting-watchdog.answer"
-local CHECK_EVERY   = 60      -- seconds between watchdog checks
-local AWAY_SECS     = 15 * 60 -- keyboard/mouse idle that counts as "walked away"
-local MIN_BEFORE    = 20 * 60 -- don't nag during the first stretch of a meeting
-local HARD_CAP      = 180* 60 -- prompt regardless once a recording gets this long
-local SNOOZE        = 30 * 60 -- after "Keep recording", stay quiet this long
-local DIALOG_WAIT   = 180     -- seconds to answer before we assume you're gone
+local ANSWER_FILE    = "/tmp/meeting-watchdog.answer"
+local HEARTBEAT_FILE = os.getenv("HOME") .. "/Library/Logs/meeting-notify.heartbeat"
+local CHECK_EVERY    = 60      -- seconds between watchdog checks
+local AWAY_SECS      = 15 * 60 -- keyboard/mouse idle that counts as "walked away"
+local MIN_BEFORE     = 20 * 60 -- don't nag during the first stretch of a meeting
+local HARD_CAP       = 180* 60 -- prompt regardless once a recording gets this long
+local SNOOZE         = 30 * 60 -- after "Keep recording", stay quiet this long
+local DIALOG_WAIT    = 180     -- seconds to answer before we assume you're gone
 -- Gentle, non-blocking reminders for the case the modal triggers cannot catch:
 -- you are still at the keyboard (so not "idle") and the call was in a browser
 -- (so no Zoom process to notice quitting) but the meeting ended and you forgot.
@@ -304,12 +310,31 @@ local function sck_restore()
     end
 end
 
+-- True only when the display is provably asleep. A rebuild attempted then can
+-- neither succeed (macOS drops a sleeping display from ScreenCaptureKit's list,
+-- so init has nothing to attach to) nor return promptly: sck_reenumerate blocks
+-- on the shareable-content semaphore and can wedge this thread for good — the
+-- exact deadlock bin/obs-watchdog exists to catch, and the reason it spent whole
+-- nights restarting OBS. Skipping the rebuild while asleep is therefore both the
+-- correct thing (nothing to repair against) and what stops that thrashing; the
+-- display always wakes before you can start a meeting, and the wake itself
+-- triggers a refresh, so nothing is lost by waiting. Fails OPEN: a missing helper
+-- or any unexpected output reads as "awake", so a machine without it behaves
+-- exactly as before. This is an optimisation to dodge a known hang, never a gate
+-- the repair depends on.
+local function display_asleep()
+    return sh('"$HOME/.local/bin/display-asleep" 2>/dev/null'):match("asleep") ~= nil
+end
+
 -- Rebuild every SCK source, healthy or not. Cheaper in every sense than asking
 -- which one died: no per-source failure flag to be wrong about, and the audio
 -- stream gets repaired even though it exposes no failure flag of its own.
 local function sck_refresh()
     if sck_pending ~= nil then return end       -- one already in flight
     if obs.obs_frontend_recording_active() then return end
+    -- Never rebuild against a sleeping display: it cannot succeed and can hang
+    -- this thread (see display_asleep). The wake will trigger the refresh instead.
+    if display_asleep() then return end
     local srcs = sck_sources()
     if #srcs == 0 then return end
     sck_pending = srcs
@@ -408,7 +433,26 @@ local function read_answer()
     return nil
 end
 
+-- sck_reenumerate() blocks this thread on a plugin-internal semaphore with no
+-- timeout (see its comment); if that async fetch never resolves, tick() never
+-- returns and this script goes silent forever with OBS still "running". The
+-- display_asleep() guard now keeps that call from ever running while the display
+-- is asleep, which was its overwhelmingly common trigger (whole nights of the
+-- watchdog restarting OBS). This heartbeat + bin/obs-watchdog remain the backstop
+-- for any residual wedge, since nothing inside a frozen Lua VM can notice one —
+-- it can't inspect a frozen Lua VM, so it just checks whether this heartbeat is
+-- still advancing. Plain io, not os.execute: must stay cheap since it runs
+-- every tick, healthy or not.
+local function write_heartbeat()
+    local fh = io.open(HEARTBEAT_FILE, "w")
+    if fh then
+        fh:write(tostring(os.time()))
+        fh:close()
+    end
+end
+
 local function tick()
+    write_heartbeat()
     if not obs.obs_frontend_recording_active() then
         -- The capture stream dies while OBS sits idle, so the repair has to
         -- happen here, minutes before anyone presses the record hotkey.
@@ -515,6 +559,7 @@ function script_description()
 end
 
 function script_load(settings)
+    write_heartbeat()  -- fresh immediately, so the watchdog can't misfire before the first tick
     obs.obs_frontend_add_event_callback(on_event)
     obs.timer_add(tick, CHECK_EVERY * 1000)
     -- OBS has just built its capture streams, so start from a clean slate.

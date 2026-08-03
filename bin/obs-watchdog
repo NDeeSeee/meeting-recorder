@@ -1,0 +1,72 @@
+#!/bin/zsh
+# obs-watchdog — restart OBS if meeting-notify.lua's repair loop has hung.
+#
+# meeting-notify.lua's ScreenCaptureKit rebuild (sck_reenumerate) blocks its
+# thread on a plugin-internal semaphore with no timeout. If that async fetch
+# never resolves, OBS's Lua scripting thread freezes forever: the process
+# keeps running, but the watchdog timer that would normally repair a dead
+# capture stream (or even just log) never fires again. Recording then stays
+# broken until a human notices and restarts OBS by hand — which is what
+# happened for four days before this script existed.
+#
+# This has to live outside OBS/Lua: nothing running on the frozen thread can
+# detect its own hang. Run from launchd, not from meeting-notify.lua.
+#
+# Unlike bin/meeting-process, this does NOT need ~/Documents access (see
+# CLAUDE.md's launchd note) — it only signals/relaunches OBS and stats files
+# under ~/Library and ~/Recordings — so launchd is fine here.
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+HEARTBEAT_FILE="$HOME/Library/Logs/meeting-notify.heartbeat"
+NOTIFY_LOG="$HOME/Library/Logs/meeting-notify.log"
+MEETINGS_DIR="$HOME/Recordings/Meetings"
+
+STALE_SECS=300        # tick() heartbeats every 60s when healthy; 5x that is unhealthy, not just slow
+STARTUP_GRACE_SECS=180 # ignore a missing/stale heartbeat right after OBS (re)launches
+RECORDING_GRACE_SECS=120 # never restart OBS while an mkv looks actively written
+
+now=$(date +%s)
+
+log() {
+    print -r -- "$(date '+%Y-%m-%d %H:%M:%S') [obs-watchdog] $1" >> "$NOTIFY_LOG"
+}
+
+obs_pid=$(pgrep -f "OBS\.app/Contents/MacOS/OBS" | head -1)
+if [[ -z "$obs_pid" ]]; then
+    exit 0   # OBS isn't running; not this watchdog's job to launch it fresh
+fi
+
+obs_start=$(ps -o lstart= -p "$obs_pid" 2>/dev/null | xargs -I{} date -j -f "%a %b %d %T %Y" "{}" +%s 2>/dev/null || echo "$now")
+if (( now - obs_start < STARTUP_GRACE_SECS )); then
+    exit 0   # give script_load's own initial heartbeat write time to land
+fi
+
+if [[ -f "$HEARTBEAT_FILE" ]]; then
+    last_beat=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
+else
+    last_beat=0
+fi
+
+if (( now - last_beat < STALE_SECS )); then
+    exit 0   # heartbeat is fresh; script is alive
+fi
+
+# Never kill OBS mid-recording, even on a false positive: an actively-written
+# mkv is the one signal that matters more than a stuck repair loop.
+newest_mkv=$(find "$MEETINGS_DIR" -name '*.mkv' -newermt "-${RECORDING_GRACE_SECS}seconds" -print -quit 2>/dev/null)
+if [[ -n "$newest_mkv" ]]; then
+    exit 0
+fi
+
+log "heartbeat stale for $((now - last_beat))s — meeting-notify.lua looks hung; restarting OBS"
+osascript -e 'quit app "OBS"' >/dev/null 2>&1
+for _ in 1 2 3 4 5; do
+    pgrep -f "OBS\.app/Contents/MacOS/OBS" >/dev/null 2>&1 || break
+    sleep 1
+done
+pkill -f "OBS\.app/Contents/MacOS/OBS" >/dev/null 2>&1
+sleep 1
+open -a OBS
+log "OBS restarted by watchdog"

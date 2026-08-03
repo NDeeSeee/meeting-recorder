@@ -55,6 +55,11 @@ cp obs/meeting-notify.lua obs/merge-tracks.py ~/.local/share/obs-scripts/
 # Calendar matcher (Swift EventKit) — compile once
 mkdir -p ~/.local/share/meeting-tools/calendar
 swiftc tools/calendar/calquery.swift -o ~/.local/share/meeting-tools/calendar/calquery
+
+# Display-sleep probe (Swift CoreGraphics) — compile once. Lets meeting-notify.lua
+# skip the ScreenCaptureKit rebuild while the display is asleep, which otherwise
+# hangs the OBS scripting thread (the deadlock obs-watchdog was added to catch).
+swiftc -O tools/display-asleep.swift -o ~/.local/bin/display-asleep
 ```
 
 Ensure `~/.local/bin` is on your `PATH`.
@@ -100,6 +105,22 @@ env's `hf/` directory.
    spawns `meeting-process`. Running as an OBS child is deliberate: a launchd
    agent is blocked by macOS privacy from reading `~/Documents`, whereas a child
    of OBS inherits its granted access.
+6. **OBS watchdog** (optional but recommended) — the Lua script's
+   ScreenCaptureKit rebuild can block its own thread forever on a stuck macOS
+   semaphore, silently freezing all repair/recovery for that OBS session. A
+   separate launchd agent restarts OBS if that happens (never while a `.mkv`
+   is actively being written):
+
+   ```sh
+   install -m 755 bin/obs-watchdog ~/.local/bin/
+   sed "s/USERNAME/$(whoami)/g" launchd/com.meetingrecorder.obs-watchdog.plist \
+       > ~/Library/LaunchAgents/com.meetingrecorder.obs-watchdog.plist
+   launchctl load ~/Library/LaunchAgents/com.meetingrecorder.obs-watchdog.plist
+   ```
+
+   This agent only signals/relaunches OBS and stats files under `~/Library` and
+   `~/Recordings` — it never touches `~/Documents`, so it doesn't run into the
+   privacy restriction above.
 
 ## 6. First run
 
