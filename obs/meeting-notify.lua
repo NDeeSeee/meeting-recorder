@@ -18,6 +18,8 @@
 --    rebuild can block this thread forever on a stuck macOS semaphore — see the
 --    comment on write_heartbeat() — and nothing inside a frozen Lua VM can
 --    notice or recover from that itself.
+-- 7. Publishes which display is being recorded and applies switch requests
+--    from the tools/meeting-display menu-bar helper.
 
 local obs = obslua
 
@@ -404,6 +406,112 @@ local function warn_if_capture_dead()
         "then start again.\" as critical' >/dev/null 2>&1 &")
 end
 
+------------------------------------------------------------ display switcher
+
+-- The Meeting scene holds one display-capture source per monitor, and exactly one
+-- is visible — that is the display being recorded. Switching only shows/hides
+-- scene items (every source keeps its own stream running), so it is instant and
+-- never goes near the ScreenCaptureKit rebuild that can wedge this thread.
+-- tools/meeting-display.swift (a menu-bar helper) talks to us through two files,
+-- like the watchdog's ANSWER_FILE: we publish the sources and which is visible,
+-- and it drops a request naming the source to show.
+local DISPLAY_STATE   = os.getenv("HOME") .. "/Library/Logs/meeting-notify.display"
+local DISPLAY_REQUEST = os.getenv("HOME") .. "/Library/Logs/meeting-notify.display-request"
+local DISPLAY_SCENE   = "Meeting"
+local DISPLAY_POLL_MS = 500
+local DISPLAY_REFRESH = 30   -- rewrite an unchanged state this often, so the helper can spot a hung script
+
+local display_last  = nil    -- last state written, to skip identical rewrites
+local display_wrote = 0      -- os.time() of that write
+
+local function json_str(s)
+    return '"' .. (tostring(s):gsub('[%c"\\]', function(c)
+        return string.format("\\u%04x", c:byte())
+    end)) .. '"'
+end
+
+-- Calls fn(item, name, display_uuid) for each display capture in the Meeting
+-- scene. Reads settings only, never properties: building the properties would
+-- re-enumerate SCShareableContent (see sck_reenumerate) every half second.
+local function each_display_item(fn)
+    local scene_src = obs.obs_get_source_by_name(DISPLAY_SCENE)
+    if scene_src == nil then return end
+    local items = obs.obs_scene_enum_items(obs.obs_scene_from_source(scene_src))
+    if items ~= nil then
+        for _, item in ipairs(items) do
+            local src = obs.obs_sceneitem_get_source(item)
+            if obs.obs_source_get_id(src) == SCK_VIDEO_ID then
+                local st = obs.obs_source_get_settings(src)
+                if obs.obs_data_get_int(st, "type") == 0 then
+                    fn(item, obs.obs_source_get_name(src), obs.obs_data_get_string(st, "display_uuid"))
+                end
+                obs.obs_data_release(st)
+            end
+        end
+        obs.sceneitem_list_release(items)
+    end
+    obs.obs_source_release(scene_src)
+end
+
+local function display_apply(want)
+    local known, changed = false, false
+    each_display_item(function(_, name) if name == want then known = true end end)
+    if not known then
+        log_line("display switch ignored: no display source named " .. want)
+        return
+    end
+    -- Show the new one before hiding the old, so no frame renders with neither.
+    each_display_item(function(item, name)
+        if name == want and not obs.obs_sceneitem_visible(item) then
+            obs.obs_sceneitem_set_visible(item, true)
+            changed = true
+        end
+    end)
+    each_display_item(function(item, name)
+        if name ~= want and obs.obs_sceneitem_visible(item) then
+            obs.obs_sceneitem_set_visible(item, false)
+            changed = true
+        end
+    end)
+    if changed then log_line("recording display -> " .. want) end
+end
+
+local function display_poll()
+    local fh = io.open(DISPLAY_REQUEST, "r")
+    if fh then
+        local want = (fh:read("*l") or ""):match("^%s*(.-)%s*$")
+        fh:close()
+        os.remove(DISPLAY_REQUEST)
+        if want ~= "" then display_apply(want) end
+    end
+
+    local sources = {}
+    each_display_item(function(item, name, uuid)
+        sources[#sources + 1] = string.format('{"name":%s,"display_uuid":%s,"visible":%s}',
+            json_str(name), json_str(uuid), tostring(obs.obs_sceneitem_visible(item)))
+    end)
+    local scene_name = ""
+    local cur = obs.obs_frontend_get_current_scene()
+    if cur ~= nil then
+        scene_name = obs.obs_source_get_name(cur)
+        obs.obs_source_release(cur)
+    end
+    local body = string.format('"recording":%s,"scene":%s,"sources":[%s]',
+        tostring(obs.obs_frontend_recording_active()), json_str(scene_name), table.concat(sources, ","))
+
+    local now = os.time()
+    if body == display_last and now - display_wrote < DISPLAY_REFRESH then return end
+    -- Write-then-rename so the helper never reads a half-written file.
+    local tmp = DISPLAY_STATE .. ".tmp"
+    local out = io.open(tmp, "w")
+    if not out then return end
+    out:write(string.format('{%s,"updated":%d}\n', body, now))
+    out:close()
+    if os.rename(tmp, DISPLAY_STATE) then
+        display_last, display_wrote = body, now
+    end
+end
+
 -------------------------------------------------------------------- watchdog
 
 -- Ask asynchronously so the OBS thread never blocks on the dialog.
@@ -569,12 +677,17 @@ function script_load(settings)
     -- Heal a stream that died before this script came up (e.g. an in-place
     -- reload while the stream was already dead), rather than waiting a cycle.
     obs.timer_add(sck_boot, 2000)
+    obs.timer_add(display_poll, DISPLAY_POLL_MS)
     -- Catch up on recordings left unprocessed (e.g. after an OBS crash).
     run_pipeline()
 end
 
 function script_unload()
     obs.obs_frontend_remove_event_callback(on_event)
+    obs.timer_remove(display_poll)
+    -- No state file = OBS is gone; the menu-bar helper shows that immediately
+    -- instead of waiting for the state to go stale.
+    os.remove(DISPLAY_STATE)
     -- A refresh leaves show_cursor inverted for a fraction of a second. Quitting
     -- or reloading inside that window would persist the wrong value into the
     -- scene collection, so put it back before we go — unless a recording is

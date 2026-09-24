@@ -121,6 +121,26 @@ env's `hf/` directory.
    This agent only signals/relaunches OBS and stats files under `~/Library` and
    `~/Recordings` — it never touches `~/Documents`, so it doesn't run into the
    privacy restriction above.
+7. **Display switcher** (optional, for more than one monitor) — add one
+   **macOS Screen Capture** source (Method: Display) per monitor to the
+   **Meeting** scene, each fitted to the canvas, with only one visible. The
+   visible one is what gets recorded. A menu-bar helper shows which display
+   that is (red `●` while recording, `○` when idle) and switches on click;
+   **Auto — follow Zoom window** (on by default) switches to the display that
+   holds the largest Zoom window. It talks to `meeting-notify.lua` through
+   `~/Library/Logs/meeting-notify.display` (state) and
+   `meeting-notify.display-request` (switch request).
+
+   ```sh
+   swiftc -O tools/meeting-display.swift -o ~/.local/bin/meeting-display
+   sed "s/USERNAME/$(whoami)/g" launchd/com.meetingrecorder.meeting-display.plist \
+       > ~/Library/LaunchAgents/com.meetingrecorder.meeting-display.plist
+   launchctl load ~/Library/LaunchAgents/com.meetingrecorder.meeting-display.plist
+   ```
+
+   Every display source keeps its own capture stream open, so macOS "Currently
+   Sharing" lists all of them. That is expected. Don't press **Stop Sharing**:
+   it kills every OBS capture stream, meeting audio included.
 
 ## 6. First run
 
