@@ -6,11 +6,17 @@ Outputs into <MEETING_DIR>/slides/:
   contact-sheet.jpg     montage of all frames (ffmpeg tile filter)
   slides.md             each frame + the transcript lines spoken around it
 
+Outputs into <MEETING_DIR>/.slides-status (JSON) when there is nothing to
+extract for a deterministic reason (black video, no scene changes, no video
+track, too short), so the full decode happens once, not on every pass.
+
 Contract: ~/.local/share/meeting-modules/README.md
-Idempotent: exits 0 immediately if slides/slides.md already exists.
+Idempotent: exits 0 immediately if slides/slides.md or .slides-status exists.
+Delete .slides-status to force a re-scan.
 Offline, stdlib-only, no venv needed (ffmpeg/ffprobe do all the heavy lifting).
 """
 
+import json
 import os
 import re
 import shutil
@@ -18,6 +24,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 # ---- tuning -----------------------------------------------------------------
 SCAN_FPS = 1  # sample 1 frame/sec; slides don't change faster than that
@@ -27,6 +34,14 @@ MIN_GAP = 12  # seconds; ignore a candidate this close to the previous keeper
 DHASH_DIST = 12  # <= this hamming distance (of 64) == "same slide", drop it
 MAX_FRAMES = 40  # hard cap; if exceeded, keep the highest-scoring ones
 MIN_DURATION = 120  # shorter meetings than this: nothing worth extracting
+# Black-screen probe (a few sampled frames, far cheaper than the scene scan). OBS
+# records limited-range video, so a black frame has YMAX ~16-17. YMAX (not
+# YAVG) is the test, because a dark-themed screen has a low average but bright
+# text. A recording is "black" when nearly every sampled frame is.
+BLACK_YMAX = 20
+BLACK_RATIO = 0.95
+BLACK_SAMPLES = 10  # frames sampled across the recording
+BLACK_MIN_SAMPLES = 3  # fewer readable samples than this: don't judge
 OUT_W = 1600  # output frame width
 NARRATION_WINDOW = 20  # +/- seconds of transcript around each frame
 TILE_COLS = 4
@@ -89,6 +104,28 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, check=False, **kw)
 
 
+def write_status(meeting_dir, status, **detail):
+    """Record a deterministic 'nothing to extract' outcome (atomic, rule 3).
+
+    This marker is the idempotency stamp for every no-output branch, so the
+    expensive decode is not repeated on every pipeline pass. Transient
+    conditions (recording offline, probe/scan errors) never write it.
+    """
+    path = os.path.join(meeting_dir, ".slides-status")
+    doc = {"status": status, **detail,
+           "written": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    fd, tmp = tempfile.mkstemp(dir=meeting_dir, prefix=".slides-status.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def hhmmss(seconds):
     s = int(seconds)
     return f"{s // 3600:02d}-{(s % 3600) // 60:02d}-{s % 60:02d}"
@@ -100,7 +137,7 @@ def clock(seconds):
 
 
 def probe(mkv):
-    """Return (has_video, duration_seconds)."""
+    """Return (has_video, duration_seconds), or None if ffprobe failed."""
     r = run(
         [
             "ffprobe", "-v", "error",
@@ -112,7 +149,7 @@ def probe(mkv):
         ]
     )
     if r.returncode != 0:
-        return False, 0.0
+        return None
     has_video = False
     duration = 0.0
     for line in r.stdout.split():
@@ -126,8 +163,35 @@ def probe(mkv):
     return has_video, duration
 
 
+def black_ratio(mkv, duration):
+    """(fraction of sampled frames that are black, n_samples), or None on error.
+
+    Samples BLACK_SAMPLES frames spread across the recording with fast input
+    seeking (-ss before -i), ~0.1 s each. A full keyframe pass was measured at
+    ~13 s on a normal 1 h recording, which would double the first-run cost of
+    every non-black meeting.
+    """
+    ymax = []
+    for i in range(BLACK_SAMPLES):
+        t = duration * (i + 0.5) / BLACK_SAMPLES
+        r = run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{t:.2f}", "-i", mkv,
+                 "-map", "0:v:0", "-frames:v", "1", "-an", "-sn",
+                 "-vf", "scale=64:-2,signalstats,metadata=print:key=lavfi.signalstats.YMAX:file=-",
+                 "-f", "null", "-"])
+        m = re.search(r"lavfi\.signalstats\.YMAX=([\d.]+)", r.stdout)
+        if r.returncode == 0 and m:
+            ymax.append(float(m.group(1)))
+    if not ymax:
+        log("black-frame probe got no samples")
+        return None
+    return sum(1 for y in ymax if y <= BLACK_YMAX) / len(ymax), len(ymax)
+
+
 def scene_candidates(mkv, tmp):
-    """One decode pass: (timestamp, scene_score) for every candidate frame."""
+    """One decode pass: (timestamp, scene_score) for every candidate frame.
+
+    Returns None if the scan itself failed (so no status marker is written).
+    """
     meta = os.path.join(tmp, "scores.txt")
     vf = (
         f"fps={SCAN_FPS},scale={SCAN_W}:-2,"
@@ -137,7 +201,7 @@ def scene_candidates(mkv, tmp):
              "-vf", vf, "-f", "null", "-"])
     if r.returncode != 0:
         log(f"scene scan failed: {r.stderr.strip()[:300]}")
-        return []
+        return None
     if not os.path.exists(meta):
         return []
     with open(meta, encoding="utf-8", errors="replace") as fh:
@@ -232,7 +296,9 @@ def main():
 
     out_dir = os.path.join(meeting_dir, "slides")
     slides_md = os.path.join(out_dir, "slides.md")
-    if os.path.exists(slides_md):  # rule 1 / rule 6: cheap idempotency check first
+    status_path = os.path.join(meeting_dir, ".slides-status")
+    # rule 1 / rule 6: cheap idempotency check first (output OR a recorded skip)
+    if os.path.exists(slides_md) or os.path.exists(status_path):
         return 0
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -255,21 +321,46 @@ def main():
     txt = os.environ.get("MEETING_TXT") or os.path.join(meeting_dir, base + ".txt")
 
     if not os.path.exists(mkv):
+        # Offline (e.g. a dangling symlink to an unmounted volume): transient,
+        # so no status marker -- try again when the media is back.
         log("no recording; nothing to do")
         return 0
 
-    has_video, duration = probe(mkv)
+    if os.path.exists(os.path.join(meeting_dir, ".video-black")):
+        # The orchestrator's ingest QC already found the video black.
+        log("WARN screen recording is black (.video-black); no slides to extract")
+        write_status(meeting_dir, "black", source=".video-black")
+        return 0
+
+    probed = probe(mkv)
+    if probed is None:
+        log("ffprobe failed on the recording; will retry next pass")
+        return 0
+    has_video, duration = probed
     if not has_video:
         log("no video track; nothing to do")
+        write_status(meeting_dir, "no-video")
         return 0
     if duration < MIN_DURATION:
         log(f"meeting is only {duration:.0f}s; nothing to do")
+        write_status(meeting_dir, "too-short", duration_seconds=round(duration, 1))
+        return 0
+
+    black = black_ratio(mkv, duration)
+    if black and black[1] >= BLACK_MIN_SAMPLES and black[0] >= BLACK_RATIO:
+        log(f"WARN screen recording is black ({black[0]:.0%} of {black[1]} sampled frames "
+            f"have YMAX<={BLACK_YMAX}); no slides to extract")
+        write_status(meeting_dir, "black", black_ratio=round(black[0], 3),
+                     samples=black[1], duration_seconds=round(duration, 1))
         return 0
 
     tmp = tempfile.mkdtemp(prefix="slides.", dir=meeting_dir)
     try:
         cands = scene_candidates(mkv, tmp)
+        if cands is None:
+            return 1  # real error; no marker, so the next pass retries
         log(f"{len(cands)} scene candidates above {SCENE_TH}")
+        n_raw = len(cands)
         cands = thin_by_gap(cands)
 
         # Cap: keep the strongest scene changes, then restore time order.
@@ -277,6 +368,8 @@ def main():
             cands = sorted(sorted(cands, key=lambda c: -c[1])[:MAX_FRAMES])
         if not cands:
             log("no distinct frames found; nothing to do")
+            write_status(meeting_dir, "no-candidates", scene_threshold=SCENE_TH,
+                         duration_seconds=round(duration, 1))
             return 0
 
         kept, hashes = [], []
@@ -293,8 +386,10 @@ def main():
             kept.append((ts, path))
 
         if not kept:
-            log("all frames deduplicated away; nothing to do")
-            return 0
+            # dhash dedup always keeps the first frame, so an empty list means
+            # every frame extraction failed: a real error, not a skip.
+            log(f"could not extract any of {len(cands)} candidate frames ({n_raw} raw)")
+            return 1
         log(f"{len(kept)} distinct frames kept")
 
         sheet = os.path.join(tmp, "contact-sheet.jpg")

@@ -12,6 +12,11 @@
 	<integer>300</integer>
 	<key>RunAtLoad</key>
 	<false/>
+	<!-- obs-watchdog backgrounds a blocking `osascript display alert` when it
+	     gives up after repeated restarts; without this, launchd kills the
+	     job's process group on exit and the alert vanishes immediately. -->
+	<key>AbandonProcessGroup</key>
+	<true/>
 	<key>StandardErrorPath</key>
 	<string>/Users/USERNAME/Library/Logs/obs-watchdog.stderr.log</string>
 </dict>

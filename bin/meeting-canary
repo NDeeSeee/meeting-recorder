@@ -1,0 +1,398 @@
+#!/bin/zsh
+# meeting-canary — prove a recording in progress actually contains content.
+#
+# Every recording from 2026-11-02 to 11-04 was black (the visible display
+# source pointed at an unplugged monitor) and nothing noticed for 2.5 days:
+# all the in-OBS checks asked whether a *source* looked alive, never whether
+# the *file* had anything in it. This is that positive check. It looks at the
+# tail of the growing .mkv itself, so it catches black, frozen and silent
+# captures no matter which layer caused them.
+#
+# Spawned detached by obs/meeting-notify.lua at RECORDING_STARTED (never run
+# inline on an OBS thread). It checks ~45 s in, then every 10 min, and exits
+# on its own once the file stops growing. Read-only on the recording.
+#
+#   meeting-canary --watch [MKV]   loop for one recording (what OBS runs); with
+#                                  no MKV, wait for the newest one to appear
+#   meeting-canary --once  MKV     one check now; writes .capture-health.json
+#                                  and alerts, exactly like a --watch pass
+#   meeting-canary --check MKV     one check, JSON to stdout, writes and alerts
+#                                  NOTHING (safe against any finished meeting)
+#
+# Findings:
+#   black            video YMAX <= 20 on every sampled frame      -> critical
+#   frozen           no frame change in two consecutive checks
+#                    (>= 10 min apart) with the same picture AND
+#                    "Meeting audio" silent or absent             -> critical
+#   still-picture    the same, but the meeting audio is live      -> banner, once
+#   no-system-audio  "Meeting audio" AND its backup <= -80 dB in
+#                    SILENT_RUNS consecutive windows             -> critical
+#   system-audio-quiet  the same in fewer windows (a pause)     -> log only;
+#                    the next check comes after RECHECK, not CHECK_EVERY
+#   meeting-audio-silent / backup-silent / mic-silent             -> banner, once
+# A single still window is only "static" (reading a slide is legitimate),
+# which is why frozen needs the previous check's verdict as well. Even ten
+# still minutes are legitimate (an audio-only call over a static desktop), so
+# the modal needs corroboration: a dead ScreenCaptureKit session takes its
+# audio stream ("Meeting audio") down with the picture. Without that it is
+# only a banner, never advice to stop a recording that may be fine.
+#
+# Results go to <meeting>/.capture-health.json (atomic write) so the pipeline
+# and summary can disclose a bad capture.
+
+set -u
+LOCK_DIR=""
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+# The CANARY_* overrides exist for offline testing against fixtures only.
+MEET_ROOT="${MEETING_ROOT:-$HOME/Recordings/Meetings}"
+LOG="${CANARY_LOG:-$HOME/Library/Logs/meeting-notify.log}"   # same log as the OBS script
+QUIET=${CANARY_QUIET:-0}                   # 1 = log alerts instead of showing them
+FIRST_CHECK=${CANARY_FIRST:-45}   # seconds after start: long enough for real frames + audio
+CHECK_EVERY=${CANARY_EVERY:-600}  # seconds between later checks
+# One silent 30 s window is ordinary: across 44 sampled windows of real meetings
+# ~1 in 5 was digital silence (a pause, everyone muted), and the BlackHole backup
+# is silent whenever output bypasses the Multi-Output device. So silence is only
+# an alarm when it persists: recheck soon, alert after SILENT_RUNS in a row.
+RECHECK=${CANARY_RECHECK:-60}     # seconds to the next check after a silent window
+SILENT_RUNS=${CANARY_SILENT_RUNS:-3}
+POLL=${CANARY_POLL:-15}           # seconds between "still growing?" polls
+ENDED_AFTER=90        # no growth for this long = recording stopped or paused
+                      # (OBS respawns the canary on unpause; the lock dedupes)
+WINDOW=30             # seconds of recording to analyse per check
+BLACK_YMAX=20         # luma; pure black is 16 in limited range
+STATIC_YDIF=0.5       # per-keyframe mean luma change below this = no motion
+SILENT_DB=-80         # mean_volume; digital silence measures -91 dB
+FF_TIMEOUT=60         # seconds; a check that takes longer is abandoned
+LOW_SPACE_GIB=20      # warn at record start below this much free space
+
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') canary: $*" >> "$LOG"; }
+
+# Text lands in an AppleScript string inside a shell single-quoted argument.
+
+banner() {   # title message sound
+    (( QUIET )) || /usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name (item 3 of argv)' -e 'end run' -- "$1" "$2" "$3" >/dev/null 2>&1 &
+    log "$2"
+}
+
+critical() { # title message — modal, async, stays up until dismissed
+    banner "$1" "$2" "Basso"
+    (( QUIET )) || /usr/bin/osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' -e 'end run' -- "$1" "$2" >/dev/null 2>&1 &
+}
+
+# --- reading a file that is still being written --------------------------------
+# A Matroska file being recorded has no Cues and no Duration yet, so ffmpeg's
+# -sseof ("Cannot use -sseof, file duration not known") and fast -ss seeking
+# both fail or read the whole file. Instead this emits a minimal header (EBML
+# header + an unknown-size Segment + Info + Tracks, copied verbatim) followed by
+# the file's tail starting at a real Cluster boundary. SeekHead/Cues/Tags are
+# dropped because they point at offsets that do not exist in the spliced
+# stream; the cluster search is done here because a pipe cannot seek back for
+# the demuxer's own resync. Works the same on finished files. System perl:
+# always present on macOS, no venv, no temp file.
+SPLICE=$(cat <<'PERL'
+use strict; use warnings;
+my ($path, $tail) = @ARGV;
+open(my $f, "<:raw", $path) or die "open: $!\n";
+my $size = -s $f;
+read($f, my $b, 4194304) // die "read: $!\n";
+my $p = 0;
+sub vint {                      # EBML variable-length int; $raw keeps marker (IDs)
+  my ($raw) = @_; return if $p >= length $b;
+  my $c = ord(substr($b, $p, 1)); my ($len, $m) = (1, 0x80);
+  while ($len <= 8 && !($c & $m)) { $len++; $m >>= 1 }
+  return if $len > 8 || $p + $len > length $b;
+  my $v = $raw ? $c : ($c & ($m - 1)); my $ones = (($c & ($m - 1)) == $m - 1);
+  for my $i (1 .. $len - 1) { my $x = ord(substr($b, $p + $i, 1)); $v = $v * 256 + $x; $ones &&= $x == 255 }
+  $p += $len; return ($v, !$raw && $ones);
+}
+my ($id) = vint(1); die "not matroska\n" unless defined $id && $id == 0x1A45DFA3;
+my ($sz) = vint(0); die "bad EBML header\n" unless defined $sz; $p += $sz;
+my $out = substr($b, 0, $p);
+($id) = vint(1); die "no Segment\n" unless defined $id && $id == 0x18538067;
+vint(0);
+$out .= "\x18\x53\x80\x67\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
+my $cluster;
+while (1) {
+  my $start = $p; ($id) = vint(1); die "no Cluster in first 4 MiB\n" unless defined $id;
+  if ($id == 0x1F43B675) { $cluster = $start; last }
+  my ($s, $unk) = vint(0); die "bad top-level element\n" if !defined $s || $unk;
+  die "header truncated\n" if $p + $s > length $b;
+  $out .= substr($b, $start, $p + $s - $start) if $id == 0x1549A966 || $id == 0x1654AE6B;
+  $p += $s;
+}
+my $from = $size - $tail; $from = $cluster if $from < $cluster;
+seek($f, $from, 0) or die "seek: $!\n";
+my $buf = ""; read($f, $buf, $size - $from) // die "read: $!\n";
+my ($at, $i) = (-1, 0);
+while (($i = index($buf, "\x1F\x43\xB6\x75", $i)) >= 0) {
+  my $c = ord(substr($buf, $i + 4, 1) // "\0"); my ($len, $m) = (1, 0x80);
+  while ($len <= 8 && !($c & $m)) { $len++; $m >>= 1 }
+  my $k = $i + 4 + $len;
+  $k += 6 if substr($buf, $k, 2) eq "\xBF\x84";      # optional CRC-32 child first
+  if ($len <= 8 && substr($buf, $k, 1) eq "\xE7") { $at = $i; last }   # then Timestamp
+  $i++;
+}
+die "no Cluster in tail\n" if $at < 0;
+binmode STDOUT; print $out; print substr($buf, $at);
+PERL
+)
+
+# Bytes covering about WINDOW seconds, from the file's own average bitrate
+# (size / (mtime - birth)): while recording, mtime is about now; for a finished
+# file it is the end of the recording. Clamped: too little gives no audio
+# statistics, too much makes the check expensive for no benefit.
+tail_bytes() {  # mkv
+    local size born mod age
+    size=$(stat -f %z "$1" 2>/dev/null) || return 1
+    born=$(stat -f %B "$1" 2>/dev/null); mod=$(stat -f %m "$1" 2>/dev/null)
+    age=$(( ${mod:-0} - ${born:-0} )); (( age < 5 || age > 86400 * 2 )) && age=$WINDOW
+    local want=$(( size * WINDOW / age ))
+    (( want < 1048576 )) && want=1048576
+    (( want > 67108864 )) && want=67108864
+    print -r -- $want
+}
+
+# Resolve tracks by their stream TITLE — the labels the whole pipeline depends
+# on — and fall back to OBS's track order only if a title is missing.
+# Prints "<video_idx> <mic_idx> <meeting_idx> <backup_idx>" (absolute indices).
+resolve_tracks() {  # mkv
+    local idx typ title v="" mic="" meet="" back=""
+    local -a audio
+    while IFS=, read -r idx typ title; do
+        if [[ $typ == video && -z $v ]]; then v=$idx
+        elif [[ $typ == audio ]]; then
+            audio+=($idx)
+            case $title in
+                Microphone) mic=$idx ;;
+                "Meeting audio") meet=$idx ;;
+                "Meeting audio (backup)") back=$idx ;;
+            esac
+        fi
+    done < <(ffprobe -v error -show_entries stream=index,codec_type:stream_tags=title -of csv=p=0 "$1" 2>/dev/null)
+    (( ${#audio} >= 2 )) && [[ -z $mic  ]] && mic=${audio[2]}
+    (( ${#audio} >= 3 )) && [[ -z $meet ]] && meet=${audio[3]}
+    (( ${#audio} >= 4 )) && [[ -z $back ]] && back=${audio[4]}
+    print -r -- "${v:--} ${mic:--} ${meet:--} ${back:--}"
+}
+
+# One analysis pass. Prints a JSON object on stdout; never writes anything.
+# Keyframes only (-skip_frame nokey): OBS emits one about every 2 s, plenty to
+# tell black/static, and decoding them at 64 px wide is a fraction of a second.
+analyse() {  # mkv [previous_json]
+    local mkv=$1 prev=${2:-}
+    local -a t; t=($(resolve_tracks "$mkv"))
+    local v=${t[1]} mic=${t[2]} meet=${t[3]} back=${t[4]}
+    local nb; nb=$(tail_bytes "$mkv") || { print -r -- '{"status":"error","error":"cannot stat file"}'; return 1; }
+
+    local fc="" maps=()
+    [[ $v    != - ]] && { fc+="[0:$v]scale=64:-2,signalstats,metadata=print:file=-[v];"; maps+=(-map "[v]"); }
+    [[ $mic  != - ]] && { fc+="[0:$mic]volumedetect@mic[am];";   maps+=(-map "[am]"); }
+    [[ $meet != - ]] && { fc+="[0:$meet]volumedetect@meet[as];"; maps+=(-map "[as]"); }
+    [[ $back != - ]] && { fc+="[0:$back]volumedetect@back[ab];"; maps+=(-map "[ab]"); }
+    [[ -z $fc ]] && { print -r -- '{"status":"error","error":"no usable streams"}'; return 1; }
+    fc=${fc%;}
+
+    local out rc
+    out=$( { /usr/bin/perl -e "$SPLICE" "$mkv" "$nb" | \
+             timeout $FF_TIMEOUT ffmpeg -nostdin -hide_banner -v info -skip_frame nokey \
+                 -i pipe:0 -filter_complex "$fc" "${maps[@]}" -f null - ; } 2>&1 )
+    rc=$?
+
+    # awk does the arithmetic and builds the verdict; zsh just passes it on.
+    print -r -- "$out" | PREV=$prev awk -v rc=$rc -v black=$BLACK_YMAX \
+        -v still=$STATIC_YDIF -v silent=$SILENT_DB -v nb=$nb -v runs=$SILENT_RUNS \
+        -v hasmeet=$([[ $meet != - ]] && print 1 || print 0) '
+        function db(name) { return (name in vol) ? vol[name] : "null" }
+        /lavfi\.signalstats\.YMAX=/ { split($0, a, "="); n++; if (a[2] + 0 > ymax) ymax = a[2] + 0 }
+        /lavfi\.signalstats\.YAVG=/ { split($0, a, "="); ysum += a[2]; ylast = a[2] + 0 }
+        /lavfi\.signalstats\.YDIF=/ { split($0, a, "="); if (nd++ > 0 && a[2] + 0 > ydif) ydif = a[2] + 0 }
+        /^\[volumedetect@[a-z]+ @/ && /mean_volume:/ {
+            nm = $1; sub(/^\[volumedetect@/, "", nm)
+            v = $0; sub(/.*mean_volume: */, "", v); sub(/ dB.*/, "", v); vol[nm] = v + 0
+        }
+        END {
+            prob = ""; sev = "ok"
+            if (n == 0) { prob = prob "\"no-video-frames\","; if (sev == "ok") sev = "warning" }
+            else if (ymax <= black) { prob = prob "\"black\","; sev = "critical" }
+            m = db("meet"); b = db("back"); mc = db("mic")
+            if (n > 0 && ymax > black && n >= 3 && ydif < still) {
+                # Static now. Frozen only if the previous check was static too
+                # and showed the same picture (YAVG equal to 2 decimals).
+                prev = ENVIRON["PREV"]; pst = (prev ~ /"static":true/); py = prev
+                if (sub(/.*"yavg_last":/, "", py)) { sub(/[,}].*/, "", py) } else py = -1
+                d = py - ylast; if (d < 0) d = -d
+                if (pst && py >= 0 && d < 0.05) {
+                    # Corroboration: the SCK audio track is silent, or present
+                    # in the file but produced no samples in this window.
+                    if (hasmeet && (m == "null" || m <= silent)) { prob = prob "\"frozen\","; sev = "critical" }
+                    else { prob = prob "\"still-picture\","; if (sev == "ok") sev = "warning" }
+                }
+            }
+            msil = (m != "null" && m <= silent); bsil = (b != "null" && b <= silent)
+            # Consecutive silent windows, carried over from the previous check.
+            pr = ENVIRON["PREV"]; prun = 0
+            if (sub(/.*"sys_silent_run":/, "", pr)) { sub(/[,}].*/, "", pr); prun = pr + 0 }
+            srun = (msil && (bsil || b == "null")) ? prun + 1 : 0
+            if (srun >= runs) { prob = prob "\"no-system-audio\","; sev = "critical" }
+            else if (srun > 0) { prob = prob "\"system-audio-quiet\","; if (sev == "ok") sev = "warning" }
+            else if (msil) { prob = prob "\"meeting-audio-silent\","; if (sev == "ok") sev = "warning" }
+            else if (bsil) { prob = prob "\"backup-silent\","; if (sev == "ok") sev = "warning" }
+            if (mc != "null" && mc <= silent) { prob = prob "\"mic-silent\","; if (sev == "ok") sev = "warning" }
+            sub(/,$/, "", prob)
+            static = (n >= 3 && ydif < still) ? "true" : "false"
+            printf "{\"status\":\"%s\",\"problems\":[%s],\"ffmpeg_rc\":%d,\"tail_bytes\":%d,", sev, prob, rc, nb
+            printf "\"video\":{\"keyframes\":%d,\"ymax\":%s,\"yavg\":%s,\"yavg_last\":%s,\"ydif_max\":%s,\"static\":%s},",
+                n, (n ? ymax : "null"), (n ? sprintf("%.2f", ysum / n) : "null"),
+                (n ? sprintf("%.2f", ylast) : "null"), (nd > 1 ? sprintf("%.3f", ydif) : "null"), static
+            printf "\"audio_mean_db\":{\"meeting\":%s,\"backup\":%s,\"mic\":%s},\"sys_silent_run\":%d}\n", m, b, mc, srun
+        }'
+}
+
+json_field() { print -r -- "$1" | sed -nE "s/.*\"$2\":\"([^\"]*)\".*/\\1/p"; }
+# Only the "problems" array counts: "warned" (appended later) lists every
+# problem ever seen, and matching it would make a relapse look like no change.
+has_problem() {  # json name
+    local pr=${1#*\"problems\":\[}
+    [[ $pr == $1 ]] && return 1           # no problems array at all
+    pr=${pr%%\]*}
+    [[ $pr == *\"$2\"* ]]
+}
+
+# Criticals alert on transitions, so a capture that stays black is one modal,
+# not one every ten minutes, and a recovery followed by a relapse alerts again.
+# Banners fire once per recording: "warned" in the json remembers them.
+raise_alerts() {  # result previous_result meeting_name
+    local r=$1 p=$2 name=$3
+    local warned=${${p#*\"warned\":\[}%%\]*}
+    [[ $p == *'"warned":['* ]] || warned=""
+    once() { has_problem "$r" $1 && [[ $warned != *\"$1\"* ]]; }
+    if has_problem "$r" black && ! has_problem "$p" black; then
+        critical "Recording is BLACK" "The recording of $name has no picture: the recorded display is off, asleep or disconnected. Pick a live screen in the menu-bar display switcher, or stop, fix it and record again."
+    fi
+    if has_problem "$r" frozen && ! has_problem "$p" frozen; then
+        critical "Recording is FROZEN" "The video of $name has not changed for 10+ minutes and the meeting audio is silent too, so screen capture has probably died. Check the OBS preview: if it is not live, stop the recording, quit and reopen OBS, then start again."
+    fi
+    if once still-picture; then
+        banner "⚠︎ Picture unchanged" "The video of $name has not changed for 10+ minutes. Fine if the screen really is static; otherwise check the OBS preview" "Tink"
+    fi
+    if has_problem "$r" no-system-audio && ! has_problem "$p" no-system-audio; then
+        critical "Participants are NOT being recorded" "Both system-audio tracks of $name are silent. If people are talking, check the audio output device (Multi-Output with BlackHole) or restart OBS."
+    fi
+    if once meeting-audio-silent; then
+        banner "⚠︎ Meeting audio silent" "Primary system-audio track is silent; the BlackHole backup is still recording participants" "Tink"
+    fi
+    # The usual state when output is not routed through the Multi-Output device:
+    # worth a log line, not an interruption at the start of every meeting.
+    once backup-silent && log "${name}: backup system-audio track silent (BlackHole not in the output path); primary is live"
+    if once mic-silent; then
+        banner "⚠︎ Microphone silent" "Your microphone track is silent in $name" "Tink"
+    fi
+}
+
+# Atomic write next to the recording. Never creates the folder: if the
+# pipeline has already renamed it, the write just fails and we stop.
+write_health() {  # dir json
+    local tmp="$1/.capture-health.json.tmp.$$"
+    print -r -- "$2" > "$tmp" 2>/dev/null && mv -f "$tmp" "$1/.capture-health.json" 2>/dev/null \
+        || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+# One check with side effects (json + alerts). Returns the result in $REPLY.
+check_and_report() {  # mkv checks_so_far
+    local mkv=$1 n=$2 dir=${1:h} prev="" res now
+    [[ -f "$dir/.capture-health.json" ]] && prev=$(<"$dir/.capture-health.json")
+    # One health file per folder, but a folder can hold several recordings
+    # (meeting-process handles that): another file's verdict and warned list
+    # say nothing about this one, so start it fresh.
+    [[ -n $prev && $(json_field "$prev" file) != "${mkv:t}" ]] && prev=""
+    res=$(analyse "$mkv" "$prev")
+    now=$(date +%s)
+    # Remember everything ever warned about, so once-only banners stay once-only.
+    local warned=$(print -r -- "$prev" | sed -nE 's/.*"warned":\[([^]]*)\].*/\1/p')
+    local probs=$(print -r -- "$res" | sed -nE 's/.*"problems":\[([^]]*)\].*/\1/p')
+    local all=$(print -r -- "${warned},${probs}" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -)
+    res="${res%\}},\"file\":\"${mkv:t}\",\"checked\":$now,\"check\":$n,\"warned\":[${all}]}"
+    raise_alerts "$res" "$prev" "${mkv:t:r}"
+    write_health "$dir" "$res" || return 1
+    log "${mkv:t:r} check $n: $(json_field "$res" status) [${probs}]"
+    REPLY=$res
+}
+
+# The disk filling up mid-meeting ends the recording (and the pipeline's
+# remux/transcode passes need headroom too). Checked here rather than in the
+# OBS script because df is a shell-out and this process is already detached.
+check_free_space() {
+    local avail
+    avail=$(df -Pk "$MEET_ROOT" 2>/dev/null | awk 'NR == 2 { print $4 }')
+    [[ $avail == <-> ]] || return 0
+    (( avail >= LOW_SPACE_GIB * 1048576 )) && return 0
+    banner "⚠︎ Low disk space" "Only $(( avail / 1048576 )) GiB free for recordings — free space soon or this recording may be cut short" "Basso"
+}
+
+newest_recording() {   # newest .mkv created within the last 3 minutes
+    local f born now=$(date +%s) best="" bestt=0
+    setopt local_options null_glob
+    for f in "$MEET_ROOT"/*/*.mkv(N.om[1,5]); do
+        born=$(stat -f %B "$f" 2>/dev/null) || continue
+        (( now - born < 180 && born > bestt )) && { best=$f; bestt=$born; }
+    done
+    print -r -- "$best"
+}
+
+watch() {  # [mkv]
+    local mkv=${1:-} i
+    if [[ -z $mkv ]]; then
+        for i in {1..12}; do mkv=$(newest_recording); [[ -n $mkv ]] && break; sleep 5; done
+        [[ -z $mkv ]] && { log "no new recording found to watch"; return 1; }
+    fi
+    # One watcher per recording, even if OBS spawns twice (script reload).
+    # Global, not local: the cleanup trap runs after this function's scope ends.
+    LOCK_DIR="${TMPDIR:-/tmp}/meeting-canary.${${mkv:t:r}//[^A-Za-z0-9_-]/_}.lock"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        kill -0 "$(<$LOCK_DIR/pid)" 2>/dev/null && return 0     # already watched
+        rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null     # stale: reclaim
+        mkdir "$LOCK_DIR" 2>/dev/null || return 0
+    fi
+    print -r -- $$ > "$LOCK_DIR/pid"
+    # zsh runs a signal trap and then carries on, so cleanup lives on EXIT
+    # only and the signals just exit (which runs it). Otherwise TERM would drop
+    # the lock and keep watching, letting a second watcher start alongside.
+    trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    check_free_space
+
+    local size last_size=-1 still=0 waited=0 next=$FIRST_CHECK n=0
+    while true; do
+        sleep $POLL; waited=$(( waited + POLL ))
+        [[ -f $mkv ]] || { log "${mkv:t:r}: file gone, stopping"; return 0; }
+        size=$(stat -f %z "$mkv" 2>/dev/null || print 0)
+        if (( size == last_size )); then
+            still=$(( still + POLL ))
+            (( still >= ENDED_AFTER )) && return 0        # recording stopped
+            continue
+        fi
+        still=0; last_size=$size
+        if (( waited >= next )); then
+            n=$(( n + 1 ))
+            check_and_report "$mkv" $n || log "${mkv:t:r}: check $n failed"
+            # A silent window is rechecked soon, so a dead audio route is
+            # caught within minutes but a pause never interrupts the meeting.
+            if [[ $REPLY == *'"sys_silent_run":'[1-9]* ]]; then
+                next=$(( waited + RECHECK ))
+            else
+                next=$(( waited + CHECK_EVERY ))
+            fi
+        fi
+    done
+}
+
+case ${1:-} in
+    --watch) watch "${2:-}" ;;
+    --once)  [[ -f ${2:-} ]] || { print -u2 "usage: meeting-canary --once MKV"; exit 2; }
+             check_and_report "$2" 1 && print -r -- "$REPLY" ;;
+    --check) [[ -f ${2:-} ]] || { print -u2 "usage: meeting-canary --check MKV"; exit 2; }
+             analyse "$2" ;;
+    *)       print -u2 "usage: meeting-canary --watch [MKV] | --once MKV | --check MKV"; exit 2 ;;
+esac

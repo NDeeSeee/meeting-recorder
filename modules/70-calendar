@@ -14,6 +14,23 @@
 # If Calendar access has not been granted to the process running the pipeline,
 # we log exactly what to grant and exit 0 WITHOUT writing the output file, so a
 # later run (after the user grants access) still gets a chance to match.
+#
+# Denial is a property of the process, not of the meeting, so it is remembered
+# globally in a `denied` stamp under $MEETING_TOOLS/calendar (24 h TTL). While
+# the stamp is fresh, each meeting first runs `calquery --check`, which only
+# reads EKEventStore.authorizationStatus (instant, never prompts): if access has
+# been granted since, the stamp is cleared and the meeting is matched normally;
+# otherwise the module skips the ffprobe and the full query, whose
+# 'not determined' path can block for 20 s per meeting. The skip is logged at
+# most once an hour, not once per meeting.
+#
+# The orchestrator records a skipped meeting as done (exit 0), so meetings
+# processed while access was missing are not retried by themselves: after
+# granting access, run `MEETING_RESCAN=1 meeting-process` once to match them.
+#
+# Nothing is written into MEETING_DIR unless there is validated JSON to publish:
+# a create-then-delete temp file there would bump the folder's mtime on every
+# pass for every meeting.
 
 set -uo pipefail
 
@@ -33,6 +50,40 @@ if [ -s "$OUT" ]; then
 fi
 
 log() { echo "70-calendar: $*"; }
+
+# --- Global "Calendar access denied" stamp -----------------------------------
+# Checked before ffprobe, the helper build, or the EventKit query. While the
+# stamp is fresh, ask the existing helper whether access is granted NOW
+# (`--check`: status read only, no prompt, no wait):
+#   rc 0 -> granted since the stamp was written: clear it, match normally;
+#   rc 2 -> still not granted: skip this meeting;
+#   else -> helper missing or predates --check: fall through, which rebuilds it.
+# The skip line is rate-limited by the mtime of $DENIED.logged (once an hour):
+# modules run under `timeout`, so there is no stable per-run id to key on.
+TOOLDIR="$MEETING_TOOLS/calendar"
+DENIED="$TOOLDIR/denied"
+DENIED_TTL=$((24 * 3600))
+LOG_EVERY=3600
+BIN="$TOOLDIR/calquery"
+now=$(date +%s)
+if [ -f "$DENIED" ]; then
+    stamp_age=$(( now - $(/usr/bin/stat -f %m "$DENIED" 2>/dev/null || echo 0) ))
+    if [ "$stamp_age" -ge 0 ] && [ "$stamp_age" -lt "$DENIED_TTL" ]; then
+        CHK=1
+        [ -x "$BIN" ] && { "$BIN" --check >/dev/null 2>&1; CHK=$?; }
+        if [ "$CHK" -eq 0 ]; then
+            log "Calendar access is granted now; clearing the denied stamp"
+            rm -f "$DENIED" "$DENIED.logged"
+        elif [ "$CHK" -eq 2 ]; then
+            logged_age=$(( now - $(/usr/bin/stat -f %m "$DENIED.logged" 2>/dev/null || echo 0) ))
+            if [ "$logged_age" -lt 0 ] || [ "$logged_age" -ge "$LOG_EVERY" ]; then
+                log "Calendar access still not granted; skipping calendar matching (logged at most hourly). After granting access, run MEETING_RESCAN=1 meeting-process to match meetings skipped meanwhile."
+                touch "$DENIED.logged" 2>/dev/null || true
+            fi
+            exit 0
+        fi
+    fi
+fi
 
 # --- Recording start time from the folder/base name ---------------------------
 # Expected: YYYY-MM-DD_HH-MM_meeting
@@ -58,8 +109,6 @@ if [ -z "$DURATION" ]; then
 fi
 
 # --- Build the EventKit query binary once ------------------------------------
-TOOLDIR="$MEETING_TOOLS/calendar"
-BIN="$TOOLDIR/calquery"
 SRC="$TOOLDIR/calquery.swift"
 
 mkdir -p "$TOOLDIR" || { log "cannot create $TOOLDIR"; exit 1; }
@@ -68,10 +117,16 @@ cat > "$SRC.new" <<'SWIFT_EOF'
 // calquery <YYYY-MM-DD> <HH-MM> <duration_seconds>
 // Finds the macOS Calendar event that best overlaps the recording window and
 // prints it as JSON on stdout. Exit 2 == Calendar access not granted.
+// calquery --check: exit 0 if read access is granted now, else 2. Reads the
+// authorization status only; never requests access, so it never waits.
 import Foundation
 import EventKit
 
 let a = CommandLine.arguments
+if a.count == 2 && a[1] == "--check" {
+    let st = EKEventStore.authorizationStatus(for: .event)
+    if #available(macOS 14.0, *) { exit(st == .fullAccess ? 0 : 2) } else { exit(st == .authorized ? 0 : 2) }
+}
 guard a.count >= 4, let dur = Double(a[3]) else {
     FileHandle.standardError.write("usage: calquery <YYYY-MM-DD> <HH-MM> <duration_seconds>\n".data(using: .utf8)!)
     exit(64)
@@ -239,22 +294,33 @@ else
 fi
 
 # --- Query ---------------------------------------------------------------------
-TMP="$OUT.tmp.$$"
-trap 'rm -f "$TMP"' EXIT
+# Query into $TMPDIR (outside MEETING_DIR); see the header for why.
+TMP="$(mktemp "${TMPDIR:-/tmp}/70-calendar.json.XXXXXX")" || { log "cannot create a temp file"; exit 1; }
+PUB=""
+trap 'rm -f "$TMP" ${PUB:+"$PUB"}' EXIT
 
-ERR="$(mktemp -t 70-calendar)"
+ERR="$(mktemp "${TMPDIR:-/tmp}/70-calendar.err.XXXXXX")"   # explicit X template: works with BSD and GNU mktemp
 "$BIN" "$REC_DATE" "$REC_TIME" "$DURATION" > "$TMP" 2>"$ERR"
 RC=$?
 
 if [ "$RC" -eq 2 ]; then
-    log "macOS Calendar access is NOT available: $(tr '\n' ' ' < "$ERR")"
+    REASON="$(tr '\n' ' ' < "$ERR")"
+    log "macOS Calendar access is NOT available: $REASON"
     rm -f "$ERR"
+    # Remember the denial for every meeting (atomic: temp file in the same dir, then mv).
+    if printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$REASON" > "$DENIED.tmp.$$" 2>/dev/null \
+            && mv -f "$DENIED.tmp.$$" "$DENIED"; then
+        touch "$DENIED.logged" 2>/dev/null || true   # this pass already logged the full instructions
+    else
+        rm -f "$DENIED.tmp.$$"
+    fi
     log "ACTION REQUIRED (one-off): open System Settings > Privacy & Security > Calendars and turn ON"
     log "  the app that runs meeting-process — your terminal (Terminal.app / iTerm) if you run it by"
     log "  hand, or the binary named in the LaunchAgent plist if it runs unattended. If it is not in"
     log "  the list, run this once from a normal Terminal window so macOS registers it:"
     log "      \"$BIN\" \"$REC_DATE\" \"$REC_TIME\" \"$DURATION\""
-    log "No output written; this module will retry on the next pipeline pass. Continuing (exit 0)."
+    log "No output written. Later meetings re-check access instantly and match as soon as it is granted;"
+    log "  meetings skipped meanwhile need one MEETING_RESCAN=1 meeting-process run. Continuing (exit 0)."
     exit 0
 fi
 
@@ -270,7 +336,12 @@ if command -v jq >/dev/null 2>&1; then
     jq -e . "$TMP" >/dev/null 2>&1 || { log "calendar query produced invalid JSON"; exit 1; }
 fi
 
-mv -f "$TMP" "$OUT"
+# $TMPDIR may be on another volume than MEETING_DIR, so a plain mv could be a
+# non-atomic copy. Stage a copy beside $OUT, then rename it into place.
+PUB="$OUT.tmp.$$"
+cp "$TMP" "$PUB" && mv -f "$PUB" "$OUT" || { log "cannot write $OUT"; exit 1; }
+PUB=""
+rm -f "$TMP" "$DENIED" "$DENIED.logged"   # access works now: clear any stale stamp
 trap - EXIT
 
 if command -v jq >/dev/null 2>&1 && [ "$(jq -r '.matched' "$OUT")" = "true" ]; then

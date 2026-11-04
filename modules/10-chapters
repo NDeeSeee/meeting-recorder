@@ -18,7 +18,22 @@ import subprocess
 import sys
 import tempfile
 
-MAX_TRANSCRIPT_CHARS = 120_000  # plenty for a multi-hour meeting
+# Shared hardened `claude -p` call + write_atomic (modules/lib/llm.py, installed
+# next to the modules). No bytecode cache: keep the installed lib dir clean.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import llm  # noqa: E402
+
+# There used to be a 120k-char cap here ("plenty for a multi-hour meeting"). It
+# was not: 12 transcripts are longer, and a 2h38m meeting got chapters only for
+# its first 35%, while the prompt still claimed the full duration. The summary
+# and insights calls already send whole transcripts this size, so the whole
+# (compressed, see compress_transcript) transcript is sent. This ceiling only
+# guards against a pathological file; the coverage check reports it if hit.
+MAX_PROMPT_CHARS = 1_500_000
+MERGE_WINDOW_S = 30      # one timestamp per same-speaker run of up to ~30 s
+MIN_COVERAGE = 0.60      # last chapter must start after 60% of the speech
+COVERAGE_MIN_SPEECH_S = 600  # below 10 min a late last chapter proves little
 
 
 def log(msg):
@@ -105,13 +120,38 @@ is audio checks and small talk, call it what it is, e.g. "Audio check and screen
 - The "start" MUST be a real timestamp copied from the transcript, in HH:MM:SS, non-decreasing, \
 and within the recording length. The first chapter starts at 00:00:00.
 
-Output ONLY a JSON array. No markdown fences, no prose, no explanation before or after:
-[{{"start": "00:00:00", "title": "...", "blurb": "..."}}]"""
+Return the chapters as structured output of the form:
+{{"chapters": [{{"start": "00:00:00", "title": "...", "blurb": "..."}}]}}"""
 
 RETRY_SUFFIX = """
 
-CRITICAL: your previous reply was not valid JSON. Reply with the raw JSON array and \
-absolutely nothing else. The first character of your reply must be '[' and the last must be ']'."""
+CRITICAL: your previous reply did not contain usable chapters. Return the chapters \
+object and nothing else."""
+
+COVERAGE_SUFFIX = """
+
+CRITICAL: a previous attempt ended its chapters at {last}, but people keep talking \
+until {end}. The transcript is complete — read it to the end, and make sure the \
+chapters cover the whole recording, including its last part."""
+
+CHAPTERS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chapters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string"},
+                    "title": {"type": "string"},
+                    "blurb": {"type": "string"},
+                },
+                "required": ["start", "title", "blurb"],
+            },
+        },
+    },
+    "required": ["chapters"],
+}
 
 
 def extract_json_array(text):
@@ -138,33 +178,59 @@ def extract_json_array(text):
     return None
 
 
-def claude_bin():
-    """The pipeline exports a minimal PATH that omits ~/.local/bin, where claude lives."""
-    found = shutil.which("claude")
-    if found:
-        return found
-    fallback = os.path.expanduser("~/.local/bin/claude")
-    if os.access(fallback, os.X_OK):
-        return fallback
-    return None
+def ask_claude(transcript, duration_s, suffix, archive_dir):
+    """One hardened call (see lib/llm.py). Returns the raw chapter list or None."""
+    prompt = PROMPT.format(duration=hms(duration_s)) + suffix
+    r = llm.call(prompt, stdin_text=transcript, task="chapters", schema=CHAPTERS_SCHEMA,
+                 timeout=900, archive_dir=archive_dir)
+    if not r.ok:
+        log(f"claude call failed: {r.reason}")
+        return None
+    if isinstance(r.structured, dict) and isinstance(r.structured.get("chapters"), list):
+        return r.structured["chapters"]
+    return extract_json_array(r.text)
 
 
-def ask_claude(transcript, duration_s, retry):
-    exe = claude_bin()
-    if not exe:
-        log("claude CLI not found on PATH or in ~/.local/bin")
-        return None
-    prompt = PROMPT.format(duration=hms(duration_s))
-    if retry:
-        prompt += RETRY_SUFFIX
-    p = subprocess.run(
-        [exe, "-p", prompt],
-        input=transcript, capture_output=True, text=True, timeout=900,
-    )
-    if p.returncode != 0:
-        log(f"claude exited {p.returncode}: {p.stderr.strip()[:300]}")
-        return None
-    return extract_json_array(p.stdout)
+TS_LINE = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]\s*([^:]{1,40}):\s?(.*)$")
+
+
+def compress_transcript(text):
+    """Merge consecutive same-speaker lines into one line per <=30 s run.
+
+    The "[HH:MM:SS] Participants: " prefix is a large share of every short
+    whisper line; merging keeps one timestamp per ~30 s of a speaker's run, which
+    is still far finer than any chapter boundary. Lines without a timestamp are
+    appended to the current run. Returns (compressed_text, last_seconds).
+    """
+    out, cur, last = [], None, 0
+    for line in text.splitlines():
+        m = TS_LINE.match(line)
+        if not m:
+            if cur and line.strip():
+                cur[2].append(line.strip())
+            continue
+        t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        last = max(last, t)
+        spk, words = m.group(4).strip(), m.group(5).strip()
+        if cur and cur[1] == spk and t - cur[0] < MERGE_WINDOW_S:
+            if words:
+                cur[2].append(words)
+            continue
+        if cur:
+            out.append(f"[{hms(cur[0])}] {cur[1]}: {' '.join(cur[2])}")
+        cur = [t, spk, [words] if words else []]
+    if cur:
+        out.append(f"[{hms(cur[0])}] {cur[1]}: {' '.join(cur[2])}")
+    if not out:  # no recognisable timestamps: send the text as-is
+        return text, 0
+    return "\n".join(out) + "\n", last
+
+
+def coverage(chapters, speech_end_s):
+    """Share of the spoken part of the meeting before the last chapter starts."""
+    if not chapters or speech_end_s <= 0:
+        return 1.0
+    return min(1.0, chapters[-1]["start_seconds"] / speech_end_s)
 
 
 GENERIC = {
@@ -279,16 +345,23 @@ def embed_chapters(mkv, chapters, duration_s, workdir):
             os.remove(tmp_out)
 
 
-def write_atomic(path, text):
-    d = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".chapters-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+def transcript_duration(txt):
+    """Approximate recording length from the last [HH:MM:SS] transcript line.
+
+    Used only when the recording is offline (e.g. a symlink into an unmounted
+    archive volume), so chapters can still be written; the mkv embed waits
+    until the media is back. Returns 0 if the transcript has no timestamps.
+    """
+    last = 0
+    pat = re.compile(r"^\[(\d+):(\d{2}):(\d{2})\]")
+    with open(txt, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            m = pat.match(line)
+            if m:
+                last = max(last, int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)))
+    # The last line starts before the recording ends; pad so sanitize() keeps a
+    # chapter that begins on that final line.
+    return last + 30 if last else 0
 
 
 def main():
@@ -303,19 +376,32 @@ def main():
     out_md = os.path.join(meeting_dir, f"{base}_chapters.md")
 
     have_files = os.path.exists(out_json) and os.path.exists(out_md)
-    have_embed = os.path.exists(mkv) and probe_nchapters(mkv) > 0
+    # os.path.exists() follows symlinks: False for a link into an unmounted volume.
+    mkv_online = os.path.exists(mkv)
+    if have_files and not mkv_online:
+        # Embedding markers into the master is a nice-to-have; it is retried
+        # automatically once the media is reachable again. Not an error, so the
+        # log is not buried under one failure per archived meeting per pass.
+        log("chapter files present; recording offline — mkv embed deferred")
+        return 0
+    have_embed = mkv_online and probe_nchapters(mkv) > 0
     if have_files and have_embed:
         log("chapters already present (files + mkv markers) — nothing to do")
         return 0
 
     if not os.path.exists(txt) or os.path.getsize(txt) == 0:
         die(f"transcript missing or empty: {txt}")
-    if not os.path.exists(mkv):
-        die(f"recording missing: {mkv}")
 
-    duration_s, _ = probe_streams(mkv)
-    if duration_s <= 0:
-        die(f"could not determine duration of {mkv}")
+    if mkv_online:
+        duration_s, _ = probe_streams(mkv)
+        if duration_s <= 0:
+            die(f"could not determine duration of {mkv}")
+    else:
+        duration_s = transcript_duration(txt)
+        if duration_s <= 0:
+            log("recording offline and transcript has no timestamps — nothing to do until the media is back")
+            return 0
+        log(f"recording offline; using transcript length (~{hms(duration_s)}) for chapters")
 
     chapters = None
     if have_files:
@@ -329,31 +415,59 @@ def main():
             log(f"existing {os.path.basename(out_json)} unreadable ({exc}); regenerating")
             chapters = None
 
+    cov = None
     if not chapters:
         with open(txt, encoding="utf-8", errors="replace") as fh:
-            transcript = fh.read()[:MAX_TRANSCRIPT_CHARS]
+            full = fh.read()
+        transcript, speech_end = compress_transcript(full)
+        speech_end = min(speech_end, duration_s) if speech_end else duration_s
+        if len(transcript) > MAX_PROMPT_CHARS:
+            log(f"WARN transcript still {len(transcript)} chars after compression; "
+                f"sending the first {MAX_PROMPT_CHARS} (coverage check will flag it)")
+            transcript = transcript[:MAX_PROMPT_CHARS]
+        log(f"transcript {len(full)} chars -> {len(transcript)} chars after merging same-speaker runs")
+        archive_dir = os.path.join(meeting_dir, ".llm")
+        best, best_cov, suffix = None, -1.0, ""
         for attempt in (0, 1):
             log(f"asking claude for chapters (attempt {attempt + 1}/2, {hms(duration_s)} recording)")
-            try:
-                raw = ask_claude(transcript, duration_s, retry=bool(attempt))
-            except subprocess.TimeoutExpired:
-                log("claude timed out")
-                raw = None
-            chapters = sanitize(raw, duration_s)
-            if chapters:
+            got = sanitize(ask_claude(transcript, duration_s, suffix, archive_dir), duration_s)
+            if not got:
+                log("claude did not return usable JSON chapters")
+                suffix = RETRY_SUFFIX
+                continue
+            c = coverage(got, speech_end)
+            if c > best_cov:
+                best, best_cov = got, c
+            if c >= MIN_COVERAGE or speech_end < COVERAGE_MIN_SPEECH_S:
                 break
-            log("claude did not return usable JSON chapters")
+            log(f"chapters stop at {got[-1]['start']} = {c:.0%} of the speech (ends {hms(speech_end)})"
+                + ("; asking again for full coverage" if attempt == 0 else ""))
+            suffix = COVERAGE_SUFFIX.format(last=got[-1]["start"], end=hms(speech_end))
+        chapters = best
         if not chapters:
             die("no valid chapters after 2 attempts")
+        cov = round(best_cov, 3)
+        if speech_end >= COVERAGE_MIN_SPEECH_S and best_cov < MIN_COVERAGE:
+            # Keep the best attempt rather than fail: failing would re-pay the
+            # call on every pass. The low coverage is recorded in the json.
+            log(f"WARN chapters cover only {best_cov:.0%} of the speech; keeping best attempt")
 
     md = [f"# Chapters — {base}", ""]
     md += [f"- [{c['start']}] {c['title']} — {c['blurb']}".rstrip(" —") for c in chapters]
     md.append("")
     payload = {"base": base, "duration_seconds": round(duration_s, 3), "chapters": chapters}
+    if not mkv_online:
+        payload["duration_source"] = "transcript"  # approximate; the mkv was offline
+    if cov is not None:
+        payload["coverage"] = cov  # last chapter start / end of speech
 
-    write_atomic(out_json, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-    write_atomic(out_md, "\n".join(md))
+    llm.write_atomic(out_json, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    llm.write_atomic(out_md, "\n".join(md))
     log(f"wrote {len(chapters)} chapters -> {os.path.basename(out_md)}, {os.path.basename(out_json)}")
+
+    if not mkv_online:
+        log("recording offline — mkv embed deferred until the media is reachable")
+        return 0
 
     workdir = tempfile.mkdtemp(prefix="chapters-")
     try:

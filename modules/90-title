@@ -133,10 +133,24 @@ if [[ -n "$title" ]]; then
 fi
 
 # --- 2. ask claude for a slug from the summary ------------------------------
+# Through the shared hardened helper (lib/llm.py): no tools/MCP/plugins, no
+# session transcript on disk, and a hard timeout — this used to be an unbounded
+# call made while the pipeline lock is held. Failures are logged and the raw
+# reply archived under .llm/; the folder is then simply left alone this run.
+LLM_PY="${0:A:h}/lib/llm.py"
 if [[ -z "$slug" ]]; then
     say "asking claude for a slug"
-    raw=$(claude -p 'This is a meeting summary. Reply with ONE kebab-case slug (3-5 words, lowercase ASCII letters/digits/hyphens only) naming what the meeting was actually about. Be specific to the content — never generic words like "meeting", "call", "discussion", "sync" alone. Output the slug and nothing else: no quotes, no explanation.' \
-          < "$MEETING_SUMMARY" 2>/dev/null)
+    raw=""
+    if [[ -f "$LLM_PY" ]] && errf=$(mktemp -t 90-title); then
+        raw=$(python3 "$LLM_PY" call --task title --timeout "${TITLE_TIMEOUT:-180}" \
+                --stdin "$MEETING_SUMMARY" --archive-dir "$MEETING_DIR/.llm" \
+                --prompt 'The meeting summary is on stdin. Reply with ONE kebab-case slug (3-5 words, lowercase ASCII letters/digits/hyphens only) naming what the meeting was actually about. Be specific to the content — never generic words like "meeting", "call", "discussion", "sync" alone. Output the slug and nothing else: no quotes, no explanation.' \
+                2>"$errf")
+        [[ -s "$errf" ]] && say "$(head -c 400 "$errf")"
+        rm -f "$errf"
+    else
+        say "shared LLM helper missing: $LLM_PY"
+    fi
     if [[ -n "$raw" ]]; then
         # Untrusted model output: reject anything that is not already a slug.
         slug=$(slugify "$raw" strict)

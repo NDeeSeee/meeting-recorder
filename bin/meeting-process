@@ -9,19 +9,64 @@
 # Everything beyond that is a MODULE: an independent executable in
 # ~/.local/share/meeting-modules/ run in filename order against each meeting.
 # See meeting-modules/README.md for the contract.
+#
+# Per-meeting state written here (all hidden, all small, all safe to delete —
+# deleting one simply re-arms that step on the next run):
+#   .meeting             folder is a meeting (survives 90-title's rename)
+#   .too-short           accidental hotkey tap; never processed
+#   .video-qc            result of the one-time black-video check
+#   .video-black         screen capture was black (summary carries a banner)
+#   .audio-incomplete    participant audio missing (summary carries a banner)
+#   .transcribe-state    "<input-fingerprint> <attempts> <last-epoch>" retry cap
+#   .summary-state       same, for the Claude summary
+#   .modules-state       same, for the module loop
+#   .pipeline-done       everything succeeded for exactly these inputs + module
+#                        set; lets an idle run skip the meeting without spawning
+#   .llm/                raw rejected LLM replies, for diagnosis
+#
+# Overrides (tests / tuning): MEETING_PROCESS_ROOT, MEETING_PROCESS_MODULES,
+# MEETING_PROCESS_LOG, MEETING_PROCESS_TOOLS, MEETING_WHISPER_MODEL,
+# MEETING_MERGE_TRACKS, MEETING_PROCESS_NOTIFY, MEETING_PROCESS_PATH_PREFIX,
+# MEETING_SUMMARY_MODEL, MEETING_RESCAN=1 (ignore .pipeline-done stamps), and
+# the *_TIMEOUT / MIN_FREE_MB / STABLE_SECS knobs below.
 
 set -u
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+setopt null_glob extended_glob
+zmodload -F zsh/stat b:zstat     # builtin stat: no fork per file on idle runs
+zmodload zsh/datetime            # EPOCHSECONDS, EPOCHREALTIME, strftime
 
-MEET_ROOT="$HOME/Recordings/Meetings"
-MODEL="$HOME/.local/share/whisper/ggml-large-v3-turbo.bin"
+export PATH="${MEETING_PROCESS_PATH_PREFIX:+$MEETING_PROCESS_PATH_PREFIX:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+MEET_ROOT="${MEETING_PROCESS_ROOT:-$HOME/Recordings/Meetings}"
+MODEL="${MEETING_WHISPER_MODEL:-$HOME/.local/share/whisper/ggml-large-v3-turbo.bin}"
 VAD_MODEL="$HOME/.local/share/whisper/ggml-silero-v5.1.2.bin"
-MODULE_DIR="$HOME/.local/share/meeting-modules"
-TOOLS_DIR="$HOME/.local/share/meeting-tools"
+MODULE_DIR="${MEETING_PROCESS_MODULES:-$HOME/.local/share/meeting-modules}"
+TOOLS_DIR="${MEETING_PROCESS_TOOLS:-$HOME/.local/share/meeting-tools}"
+MERGE_TRACKS="${MEETING_MERGE_TRACKS:-$HOME/.local/share/obs-scripts/merge-tracks.py}"
 OBSIDIAN_VAULT="$HOME/Documents/Obsidian Vault"
-LOG="$HOME/Library/Logs/meeting-process.log"
+LOG="${MEETING_PROCESS_LOG:-$HOME/Library/Logs/meeting-process.log}"
+EVENTS="${LOG:r}.events.jsonl"   # one JSON object per stage/module result
+NOTIFY_BIN="${MEETING_PROCESS_NOTIFY:-/usr/bin/osascript}"
 LOCK="$MEET_ROOT/.processing.lock"
+# Outside the lock dir on purpose: a request must survive the holder deleting
+# the lock, otherwise a wakeup sent just before release would be lost.
+RERUN="$MEET_ROOT/.rescan-requested"
+RENAME_FILE="$MEET_ROOT/.last-rename"
+
 MIN_DURATION=60          # seconds; anything shorter is an accidental hotkey tap
+STABLE_WINDOW=120        # only mkvs modified this recently get the stability check
+STABLE_SECS=${STABLE_SECS:-10}
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}                     # then notify and back off
+RETRY_AFTER_CAP_HOURS=${RETRY_AFTER_CAP_HOURS:-24}  # one retry/day after the cap
+MIN_FREE_MB=${MIN_FREE_MB:-2048}                    # headroom kept free on disk
+LOG_MAX_BYTES=${LOG_MAX_BYTES:-10000000}            # rotate to .1 above this
+FFPROBE_TIMEOUT=${FFPROBE_TIMEOUT:-60}
+SUMMARY_TIMEOUT=${SUMMARY_TIMEOUT:-900}  # median call is ~34 s; one hung for 2h40m
+MODULE_TIMEOUT=${MODULE_TIMEOUT:-3600}   # first run of a module may build a venv
+# A video sample counts as black when its brightest pixel is at most this
+# (limited-range black is 16). YMAX rather than YAVG: a dark-themed screen has
+# a low average but bright text.
+BLACK_YMAX=${BLACK_YMAX:-20}
 
 # VAD (voice-activity detection) skips silent stretches so Whisper does not
 # hallucinate filler ("Thank you.") on a track where nobody is speaking —
@@ -29,188 +74,759 @@ MIN_DURATION=60          # seconds; anything shorter is an accidental hotkey tap
 VAD_ARGS=(--vad --vad-model "$VAD_MODEL")
 [[ -f "$VAD_MODEL" ]] || VAD_ARGS=()
 
-log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+log() {
+    local ts; strftime -s ts '%Y-%m-%d %H:%M:%S' $EPOCHSECONDS
+    print -r -- "$ts $*" >> "$LOG"
+}
+json_str() { # <s> -> REPLY = s escaped for a JSON string body
+    local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"
+    REPLY="${s//[[:cntrl:]]/ }"
+}
+event() { # <stage> <meeting> <status> <rc> <secs> [detail]
+    local ts m d; strftime -s ts '%Y-%m-%dT%H:%M:%S%z' $EPOCHSECONDS
+    json_str "$2"; m=$REPLY; json_str "${6:-}"; d=$REPLY
+    print -r -- "{\"ts\":\"$ts\",\"stage\":\"$1\",\"meeting\":\"$m\",\"status\":\"$3\",\"rc\":$4,\"secs\":$5,\"detail\":\"$d\"}" >> "$EVENTS"
+}
+typeset -A NOTIFIED
+notify() { # <key> <title> <message> — at most one banner per key per run
+    [[ -n "${NOTIFIED[$1]:-}" ]] && return 0
+    NOTIFIED[$1]=1
+    # Text goes in as argv, never spliced into AppleScript source: meeting titles
+    # and transcript-derived text are untrusted.
+    "$NOTIFY_BIN" -e 'on run argv' \
+        -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Basso"' \
+        -e 'end run' -- "$2" "$3" >/dev/null 2>&1
+}
 
-# Single-instance guard. Self-healing: the lock records its owner's PID, so a
-# lock left behind by a killed run is reclaimed rather than blocking forever.
-if ! mkdir "$LOCK" 2>/dev/null; then
-    owner=$(cat "$LOCK/pid" 2>/dev/null)
-    if [[ -n "$owner" ]] && kill -0 "$owner" 2>/dev/null; then
-        exit 0
+# Bound an external command. Unattended means nobody is watching: a `claude`
+# waiting on a network that never answers, or a module stuck on a corrupt file,
+# would otherwise hold the lock — and so block every later recording — until
+# reboot. -k: SIGKILL if it ignores the TERM. rc 124 = timed out.
+if (( $+commands[timeout] ));    then BOUND=(timeout -k 10)
+elif (( $+commands[gtimeout] )); then BOUND=(gtimeout -k 10)
+else BOUND=()
+fi
+# Run in the BACKGROUND and wait: zsh defers a trap until the foreground command
+# returns, so a SIGTERM during an hour-long whisper would otherwise go unhandled
+# for that hour. `wait` is interruptible, so the TERM handler fires at once.
+# (GNU timeout puts the command in its own process group and forwards TERM to
+# all of it, so killing BOUND_PID stops the whole subtree.)
+BOUND_PID=""
+bound() { # <seconds> <cmd...>
+    local secs="$1"; shift
+    if (( ${#BOUND} )); then "${BOUND[@]}" "$secs" "$@" & else "$@" & fi
+    BOUND_PID=$!
+    wait $BOUND_PID
+    local rc=$?
+    BOUND_PID=""
+    return $rc
+}
+
+mtime_of() { local -a a; zstat -A a +mtime -- "$1" 2>/dev/null && REPLY=${a[1]} || REPLY=0; }
+size_of()  { local -a a; zstat -A a +size  -- "$1" 2>/dev/null && REPLY=${a[1]} || REPLY=0; }
+free_kb() { # free KiB on the volume holding the meetings
+    local -a l; l=( ${(f)"$(df -k "$MEET_ROOT" 2>/dev/null)"} )
+    REPLY=${${=${l[2]:-}}[4]:-0}
+}
+write_atomic() { # <file> <content>
+    print -r -- "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"
+}
+install_atomic() { # <src> <dst> — src may be on another volume ($TMPDIR):
+    # copy to a hidden temp beside dst first, so the final step is a rename.
+    local t="${2:h}/.${2:t}.tmp.$$"
+    mv -f "$1" "$t" && mv -f "$t" "$2"
+}
+elapsed() { printf -v REPLY '%.1f' $(( EPOCHREALTIME - $1 )); } # <t0>
+llm_dir() { [[ -d "$d/.llm" ]] || { mkdir -p "$d/.llm" && chmod 700 "$d/.llm"; }; }
+
+# --- single instance + lost-wakeup protocol ---------------------------------
+# Every launch first records a request ($RERUN), then tries to take the lock.
+# The holder keeps doing passes while a request is pending, releases the lock,
+# and checks ONCE MORE afterwards: a launch that lost the mkdir race just before
+# the release has left its request behind, so the holder re-acquires and loops.
+# Either the holder or the new launcher always sees every request.
+OWN_LOCK=0
+lock_try() { # 0 = we hold the lock; 1 = a live run holds it
+    if mkdir "$LOCK" 2>/dev/null; then
+        print -r -- "$$" > "$LOCK/pid"; OWN_LOCK=1; return 0
+    fi
+    local owner=""
+    [[ -f "$LOCK/pid" ]] && owner=$(<"$LOCK/pid")
+    if [[ -z "$owner" ]]; then
+        # The holder may have made the dir but not yet written its pid.
+        mtime_of "$LOCK"
+        (( EPOCHSECONDS - REPLY < 30 )) && return 1
+    elif kill -0 "$owner" 2>/dev/null \
+         && [[ "$(ps -p "$owner" -o command= 2>/dev/null)" == *meeting-process* ]]; then
+        return 1    # (the command check guards against a recycled PID)
     fi
     log "reclaiming stale lock (owner ${owner:-unknown} is gone)"
-    rm -rf "$LOCK"
-    mkdir "$LOCK" 2>/dev/null || exit 0
-fi
-print -r -- "$$" > "$LOCK/pid"
-trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+    # Rename first: only one of several simultaneous reclaimers can win it, so
+    # two launches cannot both delete-and-recreate the lock.
+    mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null || return 1
+    # The stale check above and this rename are not atomic: another reclaimer
+    # may have already replaced the stale lock with its own fresh one, which we
+    # just moved away. Re-check what we took; if it is not the lock we judged
+    # stale, put it back (best effort) and back off instead of double-owning.
+    local took=""
+    [[ -f "$LOCK.stale.$$/pid" ]] && took=$(<"$LOCK.stale.$$/pid")
+    if [[ "$took" != "$owner" ]]; then
+        if mkdir "$LOCK" 2>/dev/null; then
+            [[ -n "$took" ]] && print -r -- "$took" > "$LOCK/pid"
+        fi
+        rm -rf "$LOCK.stale.$$"
+        return 1
+    fi
+    rm -rf "$LOCK.stale.$$"
+    mkdir "$LOCK" 2>/dev/null || return 1
+    print -r -- "$$" > "$LOCK/pid"; OWN_LOCK=1; return 0
+}
+lock_release() {
+    if (( OWN_LOCK )) && [[ -f "$LOCK/pid" && "$(<"$LOCK/pid")" == "$$" ]]; then
+        rm -rf "$LOCK"
+    fi
+    OWN_LOCK=0
+}
+
+[[ -d "$MEET_ROOT" ]] || exit 0
+: > "$RERUN" 2>/dev/null
+lock_try || exit 0
+
+RUN_TMP=""; CUR_TMPD=""
+cleanup() {
+    [[ -n "$BOUND_PID" ]] && kill -TERM "$BOUND_PID" 2>/dev/null
+    [[ -n "$CUR_TMPD" ]] && rm -rf "$CUR_TMPD"
+    [[ -n "$RUN_TMP" ]] && rm -rf "$RUN_TMP"
+    lock_release
+}
+# The old `trap ... TERM` only removed the lock and then KEPT RUNNING, so a new
+# OBS-spawned run could overlap with it. A signal now stops the run.
+on_signal() {
+    trap - TERM INT
+    log "terminated by signal; stopping"
+    # Kill the in-flight child FIRST: zsh runs this trap immediately, but an
+    # `exit` from inside it only takes effect once the waited-on child is gone.
+    [[ -n "$BOUND_PID" ]] && kill -TERM "$BOUND_PID" 2>/dev/null
+    exit $1
+}
+trap cleanup EXIT
+trap 'on_signal 143' TERM
+trap 'on_signal 130' INT
+
+# --- logs: bounded size, private (transcript snippets end up in them) -------
+for lf in "$LOG" "$EVENTS"; do
+    size_of "$lf"
+    (( REPLY > LOG_MAX_BYTES )) && mv -f "$lf" "$lf.1"
+    [[ -f "$lf" ]] || : > "$lf"
+done
+chmod 600 "$LOG" "$EVENTS" "$LOG.1" "$EVENTS.1" 2>/dev/null
 
 [[ -f "$MODEL" ]] || { log "whisper model missing: $MODEL"; exit 1; }
+RUN_TMP=$(mktemp -d -t meeting-run) || exit 1
 
-setopt null_glob
+# A numbered module without the exec bit is silently skipped by the `*(.x)`
+# glob; that is how three features never ran. Say so once per run.
+for m in "$MODULE_DIR"/[0-9]*(.); do
+    [[ -x "$m" ]] || log "WARN module not executable, skipped: ${m:t}"
+done
 
-# --- discovery -------------------------------------------------------------
-# A meeting is any subfolder carrying a `.meeting` marker, or (first time)
-# matching OBS's naming. The marker is what lets a module RENAME the folder to
-# something human-readable without the folder becoming undiscoverable.
-# Pre-existing ZoomMeeting_* folders match neither and are never touched.
-for d in "$MEET_ROOT"/*(/); do
-    [[ -f "$d/.meeting" || "${d:t}" == *_meeting ]] || continue
+# --- retry cap ---------------------------------------------------------------
+# State file: "<fingerprint> <attempts> <last-attempt-epoch>". A failure with the
+# same input fingerprint counts up; after MAX_ATTEMPTS we notify once and only
+# retry once per RETRY_AFTER_CAP_HOURS. A changed fingerprint (file repaired,
+# volume remounted, transcript rewritten) re-arms immediately.
+attempt_allowed() { # <statefile> <fp>
+    [[ -f "$1" ]] || return 0
+    local -a s; s=( $(<"$1") )
+    [[ "${s[1]:-}" == "$2" ]] || return 0
+    (( ${s[2]:-0} < MAX_ATTEMPTS )) && return 0
+    (( EPOCHSECONDS - ${s[3]:-0} >= RETRY_AFTER_CAP_HOURS * 3600 ))
+}
+attempt_failed() { # <statefile> <fp> <what> <base> <reason> [notify-key]
+    local n=1; local -a s
+    if [[ -f "$1" ]]; then
+        s=( $(<"$1") ); [[ "${s[1]:-}" == "$2" ]] && n=$(( ${s[2]:-0} + 1 ))
+    fi
+    write_atomic "$1" "$2 $n $EPOCHSECONDS"
+    if (( n == MAX_ATTEMPTS )); then
+        log "GIVING UP on $3 for $4 after $n attempts ($5); will retry once per ${RETRY_AFTER_CAP_HOURS}h — delete ${1:t} to retry now"
+        [[ -n "${6:-}" ]] && notify "$6" "⚠︎ Meeting $3 failed" "$4: $5"
+    fi
+}
+attempt_ok() { [[ -f "$1" ]] && rm -f "$1"; return 0; }
 
-    mkvs=("$d"/*.mkv)
-    (( ${#mkvs} )) || continue
-    f="${mkvs[1]}"
-    base="${f:t:r}"
-    txt="$d/$base.txt"
-    summary="$d/${base}_summary.md"
+# --- summary (single LLM choke point) ---------------------------------------
+SUMMARY_PROMPT="You are given a raw meeting transcript (auto-transcribed, may contain errors; language may be mixed). Lines are timestamped and labelled by speaker: 'You' is the person who recorded the meeting (microphone track); 'Participants' is everyone else (meeting audio track). Use these labels to attribute points and action items correctly. Write a meeting summary in Markdown with these sections: ## TL;DR (2-3 sentences), ## Key points, ## Decisions, ## Action items (attribute to You or a named participant when identifiable), ## Open questions. Keep it factual; do not invent names or details not in the transcript. Answer in the transcript's dominant language."
+# Every summary call goes through here, via the shared hardened helper
+# ($MODULE_DIR/lib/llm.py — the same one the modules use): no tools, no MCP
+# servers, no plugins or hooks, no session transcript under ~/.claude/projects,
+# cwd an empty private dir. The model stays the user's default (the helper
+# passes ~/.claude/settings.json's model explicitly, since settings are not
+# loaded); MEETING_SUMMARY_MODEL or MEETING_LLM_MODEL override it.
+# The helper enforces SUMMARY_TIMEOUT itself (killing claude's process group);
+# `bound` is the backstop, and keeps a SIGTERM to us promptly handled.
+# Refusal screening stays in summary_problem below, the single validator.
+LLM_PY="$MODULE_DIR/lib/llm.py"
+summary_llm() { # <transcript> <out> <err>
+    if [[ ! -f "$LLM_PY" ]]; then
+        print -r -- "shared LLM helper missing: $LLM_PY" > "$3"; return 127
+    fi
+    local -a cmd=(/usr/bin/env MEETING_TOOLS="$TOOLS_DIR" python3 "$LLM_PY" call
+                  --task summary --prompt "$SUMMARY_PROMPT"
+                  --stdin "$1" --timeout "$SUMMARY_TIMEOUT" --no-refusal-check
+                  --meeting "${d:t}")
+    [[ -n "${MEETING_SUMMARY_MODEL:-}" ]] && cmd+=(--model "$MEETING_SUMMARY_MODEL")
+    bound $(( SUMMARY_TIMEOUT + 60 )) "${cmd[@]}" < /dev/null > "$2" 2> "$3"
+}
 
-    # Skip files OBS is still writing: size must be stable for 10 seconds
-    # (lsof is unreliable for detecting OBS's open recording files).
-    s1=$(/usr/bin/stat -f%z "$f")
-    sleep 10
-    s2=$(/usr/bin/stat -f%z "$f")
-    [[ "$s1" == "$s2" ]] || continue
+# Validate a summary's text. REPLY = "" if acceptable, else the reason.
+# Accepts an optional H1 title, notes and orchestrator banners before the first
+# section, and translated section names (one meeting has Dutch headings) — but
+# the first `## ` section must be TL;DR, at least 4 sections must exist, and
+# the lead-in must not be a refusal / CLI error / hook message. Real cases this
+# rejects: a pure refusal ("A safety check stopped my summary…"), a reply that
+# starts mid-sentence with only 3 sections, and a claude-mem "Memory outage"
+# notice injected above an otherwise normal summary.
+summary_problem() { # <text>
+    local text="$1" line lead="" first="" n=0
+    if [[ -z "${text//[[:space:]]/}" ]]; then REPLY="empty reply"; return; fi
+    for line in "${(@f)text}"; do
+        if [[ "$line" == '## '* ]]; then
+            (( n++ )); [[ -z "$first" ]] && first="$line"
+        fi
+        # Only the lead-in (before the first section, minus title lines) is
+        # screened for refusal/error phrases: a real TL;DR may legitimately
+        # say "safety check" or quote someone saying "I won't".
+        [[ -z "$first" && "$line" != '#'* ]] && lead+="$line"$'\n'
+    done
+    if [[ "$lead" == (#i)*(api error|execution error|prompt is too long|credit balance|invalid api key|/login|usage limit|safety check|memory outage|claude-mem|"i won't"|"i can't help"|"i cannot help"|"i'm unable to"|"i am unable to")* ]]; then
+        REPLY="refusal or error text: ${${lead//$'\n'/ }[1,120]}"
+    elif [[ -z "$first" ]]; then REPLY="no ## sections"
+    elif [[ "$first" != (#i)'## tl;dr'* ]]; then REPLY="first section is '$first', not TL;DR"
+    elif (( n < 4 )); then REPLY="only $n sections"
+    else REPLY=""
+    fi
+}
 
+AUDIO_BANNER='> ⚠︎ **Incomplete recording — participant audio was not captured.**
+> Only the microphone ("You") was recorded; everyone else is missing
+> from the transcript, so this summary reflects only one side of the
+> conversation. Likely cause: a Bluetooth output (e.g. AirPods) during
+> the meeting — use built-in speakers to capture participants.'
+VIDEO_BANNER='> ⚠︎ **Screen recording is black — no screen content was captured.**
+> Audio and transcript are unaffected, but anything shown on screen
+> (slides, shared windows) is missing. Likely cause: OBS was recording a
+> display that was disconnected or asleep.'
+
+summary_stage() { # uses d base txt summary; sets SUMMARY_OK, SUMMARY_CAPPED
+    SUMMARY_OK=0; SUMMARY_CAPPED=0
+    local state="$d/.summary-state" fp existing=0
+    size_of "$txt"; fp=$REPLY; mtime_of "$txt"; fp+=":$REPLY"
+    if [[ -s "$summary" ]]; then
+        summary_problem "$(<"$summary")"
+        [[ -z "$REPLY" ]] && { SUMMARY_OK=1; return 0; }
+        existing=1
+        # Capped: the old (invalid) summary stays and modules work on it. Let
+        # the meeting be stamped anyway, otherwise every idle run re-spawns all
+        # modules for it; summary_cap_holds re-opens the stamp once the daily
+        # retry is due.
+        attempt_allowed "$state" "$fp" || { SUMMARY_CAPPED=1; return 0; }
+        # Re-queue, but keep the old file in place until a valid replacement
+        # exists: modules keep working on it if regeneration keeps failing.
+        log "existing summary for $base is invalid ($REPLY); regenerating"
+    else
+        attempt_allowed "$state" "$fp" || return 0
+    fi
+
+    log "summarizing: $base"
+    local out="$RUN_TMP/summary.out" err="$RUN_TMP/summary.err" t0=$EPOCHREALTIME rc secs
+    summary_llm "$txt" "$out" "$err"; rc=$?
+    elapsed $t0; secs=$REPLY
+
+    local raw="" body="" reason=""
+    [[ -f "$out" ]] && raw=$(<"$out")
+    if (( rc == 124 )); then reason="timed out after ${SUMMARY_TIMEOUT}s"
+    elif (( rc )); then
+        # The helper's first stderr line names the cause (API error, auth,
+        # empty reply...); the full reply follows it and is archived below.
+        local why=""; [[ -s "$err" ]] && why=${${(f)"$(<"$err")"}[1]}
+        reason="claude exited $rc${why:+: ${why[1,200]}}"
+    else
+        # Drop anything before the first Markdown heading: hooks and notices
+        # sometimes print above the answer. The raw reply is archived if the
+        # rest is rejected.
+        local -a lines=( "${(@f)raw}" ); local i=1
+        while (( i <= $#lines )) && [[ "${lines[i]}" != '#'* ]]; do (( i++ )); done
+        if (( i > 1 && i <= $#lines )); then
+            body="${(pj:\n:)lines[i,-1]}"
+            log "dropped $(( i - 1 )) line(s) of preamble from the summary reply for $base"
+        else
+            body="$raw"
+        fi
+        summary_problem "$body"; reason="$REPLY"
+    fi
+
+    if [[ -z "$reason" ]]; then
+        local final="$body"
+        # Disclose capture problems at the top, otherwise the summary reads as a
+        # faithful record of a meeting whose participants or screen are missing.
+        [[ -f "$d/.video-black" ]] && final="$VIDEO_BANNER"$'\n\n'"$final"
+        [[ -f "$d/.audio-incomplete" ]] && final="$AUDIO_BANNER"$'\n\n'"$final"
+        if (( existing )); then
+            llm_dir && cp -p "$summary" "$d/.llm/${base}_summary.replaced-$EPOCHSECONDS.md"
+        fi
+        print -r -- "$final" > "$out" && install_atomic "$out" "$summary"
+        attempt_ok "$state"
+        SUMMARY_OK=1
+        log "summary done: ${base}_summary.md"
+        event summary "$base" ok 0 "$secs"
+    else
+        llm_dir
+        local arch="$d/.llm/summary-rejected-$EPOCHSECONDS.txt"
+        { print -r -- "# rc=$rc reason=$reason"; print -r -- "# --- stderr ---"
+          [[ -f "$err" ]] && cat "$err"; print -r -- "# --- stdout ---"; print -r -- "$raw"
+        } > "$arch"
+        rm -f "$out"
+        log "claude summary rejected for $base: $reason — first output: ${${raw//$'\n'/ }[1,200]} (raw reply: .llm/${arch:t}; will retry next run)"
+        event summary "$base" "$( (( rc == 124 )) && print timeout || print fail)" "$rc" "$secs" "$reason"
+        attempt_failed "$state" "$fp" summary "$base" "$reason" summary-failed
+    fi
+    rm -f "$err"
+}
+
+# True while a capped summary's back-off is still running (or there is no
+# summary failure at all), i.e. a .pipeline-done stamp may be honoured.
+summary_cap_holds() { # <dir>
+    [[ -f "$1/.summary-state" ]] || return 0
+    local -a s; s=( $(<"$1/.summary-state") )
+    (( ${s[2]:-0} >= MAX_ATTEMPTS && EPOCHSECONDS - ${s[3]:-0} < RETRY_AFTER_CAP_HOURS * 3600 ))
+}
+
+# --- black-video QC (once, at ingest) ---------------------------------------
+# Five fast-seek single-frame samples spread across the recording (~0.1 s
+# each). This cannot recover the video — prevention is OBS's job — but it turns
+# a silent failure into a notification and a banner.
+video_qc() { # <dur> ; uses d f base
+    local dur=$1 i t qc="$RUN_TMP/qc.txt" ymax valid=0 bright=0; local -a ym
+    for i in 1 2 3 4 5; do
+        t=$(( dur * i / 6 ))
+        bound "$FFPROBE_TIMEOUT" ffmpeg -nostdin -v error -ss "$t" -i "$f" -map 0:v:0 \
+            -frames:v 1 -vf signalstats,metadata=mode=print:file=- -f null - > "$qc" 2>/dev/null
+        ym=( ${${(M)${(f)"$(<"$qc")"}:#lavfi.signalstats.YMAX=*}#*=} )
+        (( ${#ym} )) || continue
+        ymax=${${(On)ym}[1]}
+        (( valid++ )); (( ymax > BLACK_YMAX )) && (( bright++ ))
+    done
+    rm -f "$qc"
+    if (( valid >= 3 && bright == 0 )); then
+        : > "$d/.video-black"
+        write_atomic "$d/.video-qc" "black samples=$valid max_ymax<=$BLACK_YMAX"
+        log "WARN $base: SCREEN RECORDING IS BLACK ($valid/5 samples black)"
+        # meeting-canary already raised a critical alert during the recording
+        # if it saw black ("warned" lists every problem it ever reported for
+        # this file); a second banner after stop adds nothing.
+        local health=""
+        [[ -f "$d/.capture-health.json" ]] && health=$(<"$d/.capture-health.json")
+        [[ "$health" == *"\"file\":\"${f:t}\""* && "$health" == *'"warned":['[^]]#'"black"'* ]] || \
+            notify video-black "⚠︎ Screen recording is black" "$base: the screen capture is black — check the OBS display source"
+        event video-qc "$base" black 0 0
+    elif (( valid >= 3 )); then
+        write_atomic "$d/.video-qc" "ok samples=$valid bright=$bright"
+    else
+        # Undecodable samples: leave .video-qc absent so a later run retries.
+        log "video QC inconclusive for $base ($valid/5 samples decoded)"
+    fi
+}
+
+# --- transcription -----------------------------------------------------------
+transcribe_stage() { # uses d f base txt; 0 = transcript now exists
+    local state="$d/.transcribe-state" fp
+    size_of "$f"; fp=$REPLY; mtime_of "$f"; fp+=":$REPLY"
+    attempt_allowed "$state" "$fp" || return 1
+
+    # One probe for duration, audio track count and video presence.
+    local probe dur="" n_tracks=0 has_video=0 line
+    probe=$(bound "$FFPROBE_TIMEOUT" ffprobe -v error -show_entries format=duration:stream=codec_type \
+            -of default=nw=1 "$f" 2>/dev/null)
+    for line in "${(@f)probe}"; do
+        case "$line" in
+            duration=[0-9]*)   dur=${${line#duration=}%%.*} ;;
+            codec_type=audio)  (( n_tracks++ )) ;;
+            codec_type=video)  has_video=1 ;;
+        esac
+    done
+    if [[ -z "$dur" ]] && (( n_tracks )); then
+        # duration=N/A with audio present: OBS crashed / was killed / lost
+        # power before finalizing the mkv (no Duration element). The audio
+        # still decodes, so take the last audio packet's timestamp instead.
+        # Demux only, no decode: ~1 s for a 2.4 GB recording.
+        local pts="$RUN_TMP/pts.txt"
+        bound $(( FFPROBE_TIMEOUT * 3 )) ffprobe -v error -select_streams a:0 \
+            -show_entries packet=pts_time -of csv=p=0 "$f" > "$pts" 2>/dev/null
+        dur=$(tail -n 1 "$pts" 2>/dev/null); dur=${dur%%.*}
+        rm -f "$pts"
+        if [[ "$dur" == <-> ]]; then
+            log "$base has no duration in its header (unfinalized recording); last audio packet at ${dur}s"
+        else
+            dur=""
+        fi
+    fi
+    if [[ -z "$dur" ]]; then
+        # Unreadable: never let it through as "long enough" (that is how
+        # offline symlinks and blips got re-transcribed for weeks).
+        log "cannot read duration of $base; skipping"
+        attempt_failed "$state" "$fp" transcription "$base" "recording unreadable" transcribe-failed
+        return 1
+    fi
     # Ignore accidental hotkey taps. Without this, a 3-second blip gets a
     # transcript, a Claude summary, an Obsidian note and a topic graph — junk
     # that pollutes the vault and costs real API calls.
-    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
-    dur=${dur%%.*}
-    if [[ -n "$dur" ]] && (( dur < MIN_DURATION )); then
-        if [[ ! -f "$d/.too-short" ]]; then
-            log "skipping $base: only ${dur}s (< ${MIN_DURATION}s) — accidental recording"
-            : > "$d/.too-short"
-        fi
-        continue
+    if (( dur < MIN_DURATION )); then
+        log "skipping $base: only ${dur}s (< ${MIN_DURATION}s) — accidental recording"
+        : > "$d/.too-short"
+        return 1
     fi
-
     [[ -f "$d/.meeting" ]] || : > "$d/.meeting"
 
-    # --- transcription -----------------------------------------------------
-    if [[ ! -f "$txt" ]]; then
-        log "transcribing (speaker-separated): $base"
-        # Track layout: a:1 = Microphone ("You"), a:2 = Meeting audio
-        # ("Participants"), a:3 = redundant system-audio backup.
-        tmpd="$(mktemp -d -t meeting)"
-        n_tracks=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$f" | wc -l | tr -d ' ')
+    (( has_video )) && [[ ! -f "$d/.video-qc" ]] && video_qc "$dur"
 
-        transcribe() { # <stream-index> <out-prefix>
-            local idx="$1" pref="$2" w="$tmpd/${2:t}.wav"
-            ffmpeg -y -loglevel error -i "$f" -map 0:a:$idx -vn -ac 1 -ar 16000 \
-                -c:a pcm_s16le "$w" 2>> "$LOG" || return 1
-            nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto -osrt \
-                -of "$pref" -np >> "$LOG" 2>&1
-        }
-
-        if [[ "$n_tracks" -ge 3 ]]; then
-            # Participants come from a:2. If that track is digital silence the
-            # capture source died mid-session — fall back to the backup track,
-            # and warn loudly, because a silent participant track means half the
-            # meeting is lost and nothing else would make that visible.
-            part_idx=2
-            mean=$(ffmpeg -i "$f" -map 0:a:2 -af volumedetect -f null - 2>&1 \
-                   | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p')
-            if [[ -n "$mean" ]] && (( ${mean%.*} <= -85 )); then
-                if [[ "$n_tracks" -ge 4 ]]; then
-                    bmean=$(ffmpeg -i "$f" -map 0:a:3 -af volumedetect -f null - 2>&1 \
-                            | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p')
-                    if [[ -n "$bmean" ]] && (( ${bmean%.*} > -85 )); then
-                        part_idx=3
-                        log "WARN $base: primary system audio silent; using backup track"
-                    fi
-                fi
-                if [[ $part_idx -eq 2 ]]; then
-                    log "WARN $base: NO SYSTEM AUDIO CAPTURED (participants missing)"
-                    /usr/bin/osascript -e 'display notification "System audio was not captured — participants are missing from this recording" with title "⚠︎ Meeting audio problem" sound name "Basso"' >/dev/null 2>&1
-                    # Persistent trace: a banner notification vanishes, but this
-                    # marker survives so the summary can disclose it and a later
-                    # review can tell this meeting is only one-sided.
-                    : > "$d/.audio-incomplete"
-                fi
-            fi
-            transcribe 1 "$tmpd/you" && transcribe "$part_idx" "$tmpd/participants"
-            if [[ $? -eq 0 ]]; then
-                python3 "$HOME/.local/share/obs-scripts/merge-tracks.py" \
-                    "$tmpd/you.srt" "$tmpd/participants.srt" "$txt" 2>> "$LOG"
-                [[ -f "$tmpd/participants.srt" ]] && cp "$tmpd/participants.srt" "$d/$base.srt"
-            fi
-        else
-            w="$tmpd/mix.wav"
-            if ffmpeg -y -loglevel error -i "$f" -map 0:a:0 -vn -ac 1 -ar 16000 \
-                    -c:a pcm_s16le "$w" 2>> "$LOG"; then
-                nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto -otxt -osrt \
-                    -of "$d/$base" -np >> "$LOG" 2>&1
-            fi
-        fi
-        rm -rf "$tmpd"
-
-        if [[ ! -s "$txt" ]]; then
-            log "whisper produced no transcript for $base (will retry next run)"
-            rm -f "$txt"; continue
-        fi
-        log "transcript done: $base.txt"
+    # Free-space preflight: two 16 kHz mono WAVs (32 KB/s each) plus headroom.
+    free_kb
+    local need=$(( dur * 64 + MIN_FREE_MB * 1024 ))   # KiB
+    if (( REPLY < need )); then
+        log "WARN low disk space: $(( REPLY / 1024 )) MB free, need $(( need / 1024 )) MB to transcribe $base; skipping"
+        notify low-disk "⚠︎ Meeting pipeline: disk full" "Only $(( REPLY / 1024 )) MB free — transcription paused"
+        return 1
     fi
 
-    # --- summary -----------------------------------------------------------
-    if [[ -f "$txt" && ! -f "$summary" && -s "$txt" ]]; then
-        log "summarizing: $base"
-        if claude -p "You are given a raw meeting transcript (auto-transcribed, may contain errors; language may be mixed). Lines are timestamped and labelled by speaker: 'You' is the person who recorded the meeting (microphone track); 'Participants' is everyone else (meeting audio track). Use these labels to attribute points and action items correctly. Write a meeting summary in Markdown with these sections: ## TL;DR (2-3 sentences), ## Key points, ## Decisions, ## Action items (attribute to You or a named participant when identifiable), ## Open questions. Keep it factual; do not invent names or details not in the transcript. Answer in the transcript's dominant language." \
-                < "$txt" > "$summary" 2>> "$LOG" && [[ -s "$summary" ]]; then
-            log "summary done: ${base}_summary.md"
-            # If participants were never captured, say so at the top of the
-            # summary — otherwise it reads as a faithful record of a two-sided
-            # conversation when it only reflects your microphone. Idempotent.
-            if [[ -f "$d/.audio-incomplete" ]] \
-               && ! grep -q 'participant audio was not captured' "$summary" 2>/dev/null; then
-                { print -r -- '> ⚠︎ **Incomplete recording — participant audio was not captured.**'
-                  print -r -- '> Only the microphone ("You") was recorded; everyone else is missing'
-                  print -r -- '> from the transcript, so this summary reflects only one side of the'
-                  print -r -- '> conversation. Likely cause: a Bluetooth output (e.g. AirPods) during'
-                  print -r -- '> the meeting — use built-in speakers to capture participants.'
-                  print -r -- ''
-                  cat "$summary"
-                } > "$summary.tmp" && mv "$summary.tmp" "$summary"
-            fi
-        else
-            rm -f "$summary"
-            log "claude summary failed for $base (will retry next run)"
-        fi
-    fi
+    log "transcribing (speaker-separated): $base"
+    local tmpd; tmpd="$(mktemp -d -t meeting)" || return 1
+    CUR_TMPD="$tmpd"
+    local t0=$EPOCHREALTIME wlimit=$(( dur * 2 + 600 )) dlimit=$(( dur / 4 + 300 )) reason="" ok=0
 
-    # --- enrichment modules ------------------------------------------------
-    # Each module is independent and idempotent; a failing one must never break
-    # the others or the core artifacts, so failures are logged and skipped.
-    [[ -s "$txt" && -s "$summary" ]] || continue
-    for m in "$MODULE_DIR"/*(.x); do
-        MEETING_DIR="$d" MEETING_MKV="$f" MEETING_BASE="$base" \
-        MEETING_TXT="$txt" MEETING_SRT="$d/$base.srt" MEETING_SUMMARY="$summary" \
-        MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" \
-        OBSIDIAN_VAULT="$OBSIDIAN_VAULT" MEETING_LOG="$LOG" \
-            "$m" "$d" >> "$LOG" 2>&1 \
-            || log "module failed (continuing): ${m:t} on $base"
-        # A module may rename the folder (see 90-title). Follow the move AND
-        # recompute every derived path: leaving MEETING_TXT/SUMMARY/MKV pointing
-        # at the old directory would hand the next module dead file paths.
-        if [[ ! -d "$d" ]]; then
-            newd=$(cat "$MEET_ROOT/.last-rename" 2>/dev/null)
-            if [[ -n "$newd" && -d "$newd" ]]; then
-                d="$newd"
-                f="$d/$base.mkv"
-                txt="$d/$base.txt"
-                summary="$d/${base}_summary.md"
+    transcribe() { # <stream-index> <out-prefix>; whisper stdout is the transcript
+        # text itself — keep it out of the shared log; stderr kept per track and
+        # only surfaced on failure.
+        local idx="$1" pref="$2" w="$tmpd/${2:t}.wav" e="$tmpd/${2:t}.err"
+        bound "$wlimit" ffmpeg -nostdin -y -loglevel error -i "$f" -map 0:a:$idx -vn -ac 1 -ar 16000 \
+            -c:a pcm_s16le "$w" 2>> "$e" || return 1
+        bound "$wlimit" nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto -osrt \
+            -of "$pref" -np > /dev/null 2>> "$e"
+        local rc=$?
+        rm -f "$w"
+        return $rc
+    }
+    mean_volume() { # <stream-index> -> REPLY (dB, may be empty)
+        local e="$tmpd/vol.err"
+        bound "$dlimit" ffmpeg -nostdin -i "$f" -map 0:a:$1 -af volumedetect -f null - 2> "$e"
+        REPLY=${${(M)${(f)"$(<"$e")"}:#*mean_volume:*}##*mean_volume: }
+        REPLY=${REPLY%% dB*}
+        rm -f "$e"
+    }
+
+    if (( n_tracks >= 3 )); then
+        # Track layout: a:0 = mix, a:1 = Microphone ("You"), a:2 = Meeting
+        # audio ("Participants"), a:3 = redundant system-audio backup.
+        # Participants come from a:2. If that track is digital silence the
+        # capture source died mid-session — fall back to the backup track,
+        # and warn loudly, because a silent participant track means half the
+        # meeting is lost and nothing else would make that visible.
+        local part_idx=2 mean bmean
+        mean_volume 2; mean=$REPLY
+        if [[ -n "$mean" ]] && (( ${mean%.*} <= -85 )); then
+            if (( n_tracks >= 4 )); then
+                mean_volume 3; bmean=$REPLY
+                if [[ -n "$bmean" ]] && (( ${bmean%.*} > -85 )); then
+                    part_idx=3
+                    log "WARN $base: primary system audio silent; using backup track"
+                fi
+            fi
+            if (( part_idx == 2 )); then
+                log "WARN $base: NO SYSTEM AUDIO CAPTURED (participants missing)"
+                # Only on first detection: a retry must not re-alert for an old meeting.
+                [[ -f "$d/.audio-incomplete" ]] || notify audio-missing "⚠︎ Meeting audio problem" \
+                    "System audio was not captured — participants are missing from this recording"
+                # Persistent trace: a banner notification vanishes, but this
+                # marker survives so the summary can disclose it and a later
+                # review can tell this meeting is only one-sided.
+                : > "$d/.audio-incomplete"
+            fi
+        fi
+        if transcribe 1 "$tmpd/you" && transcribe "$part_idx" "$tmpd/participants"; then
+            if python3 "$MERGE_TRACKS" "$tmpd/you.srt" "$tmpd/participants.srt" "$tmpd/merged.txt" \
+                    2>> "$tmpd/merge.err" && [[ -s "$tmpd/merged.txt" ]]; then
+                # SRT first, transcript last: $txt existing is what marks "done".
+                [[ -f "$tmpd/participants.srt" ]] && install_atomic "$tmpd/participants.srt" "$d/$base.srt"
+                install_atomic "$tmpd/merged.txt" "$txt" && ok=1
             else
-                log "meeting folder vanished and no .last-rename to follow: $base"
-                continue
+                reason="no speech in either track (or merge failed)"
+            fi
+        else
+            reason="ffmpeg/whisper failed"
+        fi
+    else
+        local w="$tmpd/mix.wav" e="$tmpd/mix.err"
+        if bound "$wlimit" ffmpeg -nostdin -y -loglevel error -i "$f" -map 0:a:0 -vn -ac 1 -ar 16000 \
+                -c:a pcm_s16le "$w" 2>> "$e" \
+           && bound "$wlimit" nice -n 10 whisper-cli -m "$MODEL" "${VAD_ARGS[@]}" -f "$w" -l auto \
+                -otxt -osrt -of "$tmpd/mix" -np > /dev/null 2>> "$e" \
+           && [[ -s "$tmpd/mix.txt" ]]; then
+            [[ -f "$tmpd/mix.srt" ]] && install_atomic "$tmpd/mix.srt" "$d/$base.srt"
+            install_atomic "$tmpd/mix.txt" "$txt" && ok=1
+        else
+            reason="single-track ffmpeg/whisper produced nothing"
+        fi
+    fi
+
+    local secs; elapsed $t0; secs=$REPLY
+    if (( ok )); then
+        log "transcript done: $base.txt"
+        event transcribe "$base" ok 0 "$secs"
+        attempt_ok "$state"
+    else
+        # Surface the tools' stderr only now, and only its tail.
+        local ef
+        for ef in "$tmpd"/*.err; do
+            [[ -s "$ef" ]] && { log "  ${ef:t}:"; tail -n 20 "$ef" >> "$LOG"; }
+        done
+        log "whisper produced no transcript for $base: $reason (will retry next run)"
+        event transcribe "$base" fail 1 "$secs" "$reason"
+        attempt_failed "$state" "$fp" transcription "$base" "$reason" transcribe-failed
+    fi
+    rm -rf "$tmpd"; CUR_TMPD=""
+    (( ok ))
+}
+
+# --- enrichment modules ------------------------------------------------------
+# Signature of the installed module set. Stored in .pipeline-done, so adding,
+# enabling or upgrading a module re-runs the loop on every meeting (the old
+# "re-scan everything" behaviour that lets new modules backfill), while an idle
+# run with nothing new skips each finished meeting without spawning anything.
+module_signature() {
+    local m; local -A st; MODS=( "$MODULE_DIR"/*(N.x) ); MODSIG="v1"
+    for m in "${MODS[@]}"; do
+        st=(); zstat -H st -- "$m" 2>/dev/null
+        MODSIG+=",${m:t}:${st[size]:-0}:${st[mtime]:-0}"
+    done
+}
+# Fingerprint of a meeting folder's visible contents: entry count, newest
+# mtime, and how many recordings are reachable (a remounted volume re-arms).
+inputs_fingerprint() { # <dir>
+    local -a e n o; e=( "$1"/*(N) ); n=( "$1"/*(Nom[1]) ); o=( "$1"/*.mkv(N-.) )
+    mtime_of "${n[1]:-$1}"
+    REPLY="${#e}:$REPLY:${#o}"
+}
+
+follow_rename() { # a module moved the folder; sets d (and paths) or fails
+    local line="" new="" old
+    [[ -f "$RENAME_FILE" ]] && line=$(<"$RENAME_FILE")
+    if [[ "$line" == *$'\t'* ]]; then
+        old=${line%%$'\t'*}; new=${line#*$'\t'}
+        [[ "$old" == "$d" ]] || new=""
+    else
+        new=$line
+    fi
+    # Accept only a folder that really holds THIS meeting: a stale or foreign
+    # .last-rename must never redirect us to another meeting's folder.
+    if ! [[ -n "$new" && -d "$new" && ( -e "$new/$base.txt" || -e "$new/${f:t}" ) ]]; then
+        local -a c; c=( "$MEET_ROOT"/*/"$base".txt(N) )
+        (( ${#c} == 1 )) && new=${c[1]:h} || new=""
+    fi
+    [[ -n "$new" ]] || return 1
+    d="$new"; f="$d/${f:t}"; txt="$d/$base.txt"; summary="$d/${base}_summary.md"
+}
+
+module_stage() { # uses d f base txt summary OFFLINE; sets MODS_OK
+    MODS_OK=0
+    local state=".modules-state" fp m rc t0 secs st failed=0
+    inputs_fingerprint "$d"; fp="$REPLY;$MODSIG"
+    attempt_allowed "$d/$state" "$fp" || return 0
+    local media_offline=0; [[ -e "$f" ]] || media_offline=1
+    for m in "${MODS[@]}"; do
+        [[ -e "$RENAME_FILE" ]] && rm -f "$RENAME_FILE"
+        t0=$EPOCHREALTIME
+        bound "$MODULE_TIMEOUT" /usr/bin/env \
+            MEETING_DIR="$d" MEETING_MKV="$f" MEETING_BASE="$base" \
+            MEETING_TXT="$txt" MEETING_SRT="$d/$base.srt" MEETING_SUMMARY="$summary" \
+            MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" \
+            OBSIDIAN_VAULT="$OBSIDIAN_VAULT" MEETING_LOG="$LOG" \
+            MEETING_MEDIA_OFFLINE="$media_offline" MEETING_FREE_KB="$PASS_FREE_KB" \
+            "$m" "$d" >> "$LOG" 2>&1
+        rc=$?
+        elapsed $t0; secs=$REPLY
+        if (( rc == 0 )); then st=ok
+        elif (( rc == 124 )); then st=timeout; failed=1
+            log "module timed out after ${MODULE_TIMEOUT}s (continuing): ${m:t} on $base"
+        else st=fail; failed=1
+            log "module failed (continuing): ${m:t} on $base (rc=$rc)"
+        fi
+        # Successful no-op calls are the common case; keep the event stream
+        # to failures and to calls that actually did work.
+        (( rc != 0 )) || [[ "$secs" != 0.* ]] && event "module:${m:t}" "$base" "$st" "$rc" "$secs"
+        # A module may rename the folder (see 90-title). Follow the move AND
+        # recompute every derived path; if we cannot, stop this meeting rather
+        # than hand later modules dead paths.
+        if [[ ! -d "$d" ]]; then
+            if follow_rename; then
+                log "following rename: $base -> ${d:t}"
+            else
+                log "meeting folder vanished and no valid .last-rename to follow: $base"
+                return 1
             fi
         fi
     done
-done
+    inputs_fingerprint "$d"; fp="$REPLY;$MODSIG"
+    if (( failed )); then
+        attempt_failed "$d/$state" "$fp" modules "$base" "a module keeps failing"
+    else
+        attempt_ok "$d/$state"; MODS_OK=1
+    fi
+}
 
-# --- global maintenance (runs once per invocation, not per meeting) ---------
-if [[ -x "$HOME/.local/bin/meeting-maintenance" ]]; then
-    MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" MEETING_LOG="$LOG" \
-        "$HOME/.local/bin/meeting-maintenance" >> "$LOG" 2>&1 \
-        || log "meeting-maintenance failed"
-fi
+# --- one pass over the library ----------------------------------------------
+OFFLINE_LOGGED=0
+run_pass() {
+    module_signature
+    free_kb; PASS_FREE_KB=$REPLY
+    local -a ready_d ready_f recent_i recent_sz offline_untx
+    local -A vols
+    local d f m n_off=0 i best du
+    local -a mkvs online
+    # Newest first (names start with the date), so a fresh recording never
+    # waits behind the backlog. Re-globbed every pass: folders created during
+    # the previous pass are picked up.
+    for d in "$MEET_ROOT"/*(N/On); do
+        # A meeting is any subfolder carrying a `.meeting` marker, or (first
+        # time) matching OBS's naming. The marker is what lets a module RENAME
+        # the folder without it becoming undiscoverable.
+        [[ -f "$d/.meeting" || "${d:t}" == *_meeting ]] || continue
+        mkvs=( "$d"/*.mkv(N) )
+        (( ${#mkvs} )) || continue
+        # Already classified as an accidental tap: no stat, no probe. (A folder
+        # with several recordings is re-checked — the tap may not be the meeting.)
+        [[ -f "$d/.too-short" ]] && (( ${#mkvs} == 1 )) && continue
+        if [[ -z "${MEETING_RESCAN:-}" && -f "$d/.pipeline-done" ]]; then
+            inputs_fingerprint "$d"
+            [[ "$(<"$d/.pipeline-done")" == "$REPLY;$MODSIG" ]] && summary_cap_holds "$d" && continue
+        fi
+
+        online=( "$d"/*.mkv(N-.) )
+        if (( ${#online} == 0 )); then
+            # Recording is a dangling symlink (offloaded to an unmounted volume).
+            # Modules can still run on an existing transcript; nothing else can.
+            local -a tgt; zstat -L -A tgt +link -- "${mkvs[1]}" 2>/dev/null
+            [[ "${tgt[1]:-}" == /Volumes/* ]] && vols[${${tgt[1]#/Volumes/}%%/*}]=1
+            (( n_off++ ))
+            f=""
+            for m in "${mkvs[@]}"; do [[ -s "$d/${m:t:r}.txt" ]] && { f=$m; break; }; done
+            # A transcript is enough: the summary reads only the .txt, and the
+            # transcription step skips media that is not reachable.
+            if [[ -n "$f" ]]; then
+                ready_d+=("$d"); ready_f+=("$f")
+            else
+                offline_untx+=("${d:t}")
+            fi
+            continue
+        fi
+
+        # Which recording is the meeting: one already transcribed, else the
+        # longest readable one (a 15 s blip must not hide the real recording).
+        f=""
+        if (( ${#online} == 1 )); then f=${online[1]}
+        else
+            for m in "${online[@]}"; do [[ -s "$d/${m:t:r}.txt" ]] && { f=$m; break; }; done
+            if [[ -z "$f" ]]; then
+                best=-1
+                for m in "${online[@]}"; do
+                    du=$(bound "$FFPROBE_TIMEOUT" ffprobe -v error -show_entries format=duration -of csv=p=0 "$m" 2>/dev/null)
+                    du=${du%%.*}; [[ "$du" == <-> ]] || continue
+                    (( du > best )) && { best=$du; f=$m; }
+                done
+                [[ -n "$f" ]] || f=${online[1]}
+            fi
+        fi
+
+        ready_d+=("$d"); ready_f+=("$f")
+        # Only a recently modified file can still be growing; OBS appends to
+        # the mkv continuously while recording.
+        mtime_of "$f"
+        if (( EPOCHSECONDS - REPLY < STABLE_WINDOW )); then
+            size_of "$f"; recent_i+=(${#ready_d}); recent_sz+=("$REPLY")
+        fi
+    done
+
+    if (( n_off && ! OFFLINE_LOGGED )); then
+        local vnames="${(j:, :)${(k)vols}}"
+        log "$n_off recording(s) offline (volume ${vnames:-unknown} not mounted); ${#offline_untx} of them untranscribed${offline_untx:+: ${(j:, :)offline_untx[1,5]}}${offline_untx[6]:+ …}"
+        OFFLINE_LOGGED=1
+    fi
+
+    # One shared stability wait for all recently modified recordings, instead
+    # of 10 s per meeting (which made every run ~35 min).
+    if (( ${#recent_i} )); then
+        sleep "$STABLE_SECS"
+        for i in {1..${#recent_i}}; do
+            size_of "${ready_f[${recent_i[i]}]}"
+            if [[ "$REPLY" != "${recent_sz[i]}" ]]; then
+                ready_d[${recent_i[i]}]=""     # still being written; OBS respawns us on stop
+            fi
+        done
+    fi
+
+    if (( PASS_FREE_KB < MIN_FREE_MB * 1024 )); then
+        log "WARN low disk space: $(( PASS_FREE_KB / 1024 )) MB free (< ${MIN_FREE_MB} MB); skipping transcription and modules this pass"
+        notify low-disk "⚠︎ Meeting pipeline: disk full" "Only $(( PASS_FREE_KB / 1024 )) MB free — meeting processing paused"
+        return 0
+    fi
+
+    (( ${#ready_d} )) || return 0
+    local base txt summary
+    for i in {1..${#ready_d}}; do
+        d=${ready_d[i]}; f=${ready_f[i]}
+        [[ -n "$d" && -d "$d" ]] || continue
+        base="${f:t:r}"; txt="$d/$base.txt"; summary="$d/${base}_summary.md"
+
+        if [[ ! -s "$txt" ]]; then
+            [[ -e "$f" ]] || continue
+            transcribe_stage || continue
+        fi
+        summary_stage
+        [[ -s "$txt" && -s "$summary" ]] || continue
+        [[ -f "$d/.meeting" ]] || : > "$d/.meeting"
+
+        # Each module is independent and idempotent; a failing one must never
+        # break the others or the core artifacts, so failures are logged and
+        # skipped.
+        module_stage || continue
+        if (( MODS_OK && ( SUMMARY_OK || SUMMARY_CAPPED ) )); then
+            inputs_fingerprint "$d"
+            write_atomic "$d/.pipeline-done" "$REPLY;$MODSIG"
+        fi
+    done
+}
+
+# --- main loop ---------------------------------------------------------------
+MAINT_DONE=0
+while true; do
+    while [[ -e "$RERUN" ]]; do
+        rm -f "$RERUN"
+        run_pass
+    done
+
+    # --- global maintenance (once per invocation, not per meeting) ----------
+    if (( ! MAINT_DONE )) && [[ -x "$HOME/.local/bin/meeting-maintenance" ]]; then
+        MAINT_DONE=1
+        bound "$MODULE_TIMEOUT" /usr/bin/env MEETING_ROOT="$MEET_ROOT" MEETING_TOOLS="$TOOLS_DIR" \
+            MEETING_LOG="$LOG" "$HOME/.local/bin/meeting-maintenance" >> "$LOG" 2>&1 \
+            || log "meeting-maintenance failed"
+    fi
+    [[ -e "$RERUN" ]] && continue
+
+    lock_release
+    # A launch that hit the lock between our last check and the release left
+    # its request behind and exited; pick it up (or let the new holder do so).
+    [[ -e "$RERUN" ]] || break
+    lock_try || exit 0
+done
 
 exit 0

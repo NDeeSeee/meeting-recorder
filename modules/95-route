@@ -41,9 +41,10 @@ log() { print -r -- "route: $*"; }
 # Refresh at most once a day; this is I/O over every repo.
 if [[ ! -f "$PROJECTS" ]] || [[ -n "$(find "$PROJECTS" -mtime +1 2>/dev/null)" ]]; then
     now=$(date +%s)
+    # One jq-built object per repo, slurped into an array: a README heading
+    # with a backslash or control character used to make the printf-built JSON
+    # invalid, and `cand` then silently became [].
     {
-        print -r -- "["
-        first=1
         for r in "$REPO_HOME"/*(/N); do
             [[ -d "$r/.git" ]] || continue
             ct=$(git -C "$r" log -1 --format=%ct 2>/dev/null) || continue
@@ -53,15 +54,12 @@ if [[ ! -f "$PROJECTS" ]] || [[ -n "$(find "$PROJECTS" -mtime +1 2>/dev/null)" ]
             name="${r:t}"
             # A one-line description helps the classifier far more than the name.
             desc=$(head -40 "$r/README.md" 2>/dev/null \
-                   | sed -n 's/^# *//p;s/^## *//p' | head -1 | tr -d '"' | cut -c1-160)
+                   | sed -n 's/^# *//p;s/^## *//p' | head -1 | cut -c1-160)
             [[ -z "$desc" ]] && desc="$name"
-            (( first )) || print -r -- ","
-            first=0
-            printf '{"name":"%s","path":"%s","days_since_commit":%d,"desc":"%s"}' \
-                   "$name" "$r" "$days" "$desc"
+            jq -cn --arg name "$name" --arg path "$r" --argjson days "$days" --arg desc "$desc" \
+                '{name:$name, path:$path, days_since_commit:$days, desc:$desc}'
         done
-        print -r -- "]"
-    } > "$PROJECTS.tmp" && mv "$PROJECTS.tmp" "$PROJECTS"
+    } | jq -s '.' > "$PROJECTS.tmp" && mv "$PROJECTS.tmp" "$PROJECTS"
 fi
 
 cand=$(jq -c '.' "$PROJECTS" 2>/dev/null) || cand="[]"
@@ -103,7 +101,7 @@ $tldr
 DOMAIN TERMS DISCUSSED: ${topics:-none}
 KNOWN ATTENDEES: ${people_known:-unknown}
 
-Return ONLY a JSON object, no prose, no code fence:
+Return a JSON object as structured output:
 {\"projects\":[\"<exact candidate name>\", ...],
  \"people\":[\"<person full name>\", ...],
  \"thread\":\"<short topic thread name>\",
@@ -114,10 +112,21 @@ Rules: only use project names that appear EXACTLY in the candidate list. A meeti
 may match several projects, or none — an empty list is correct and expected for an
 unrelated meeting; never guess to fill the list. Only list people actually named."
 
-raw=$(print -r -- "$prompt" | claude -p 2>/dev/null)
-json=$(print -r -- "$raw" | sed -n '/{/,/}/p' | tr -d '\000')
-if ! print -r -- "$json" | jq -e . >/dev/null 2>&1; then
-    log "classifier returned non-JSON; leaving meeting unrouted (will retry next run)"
+# Through the shared hardened helper (lib/llm.py). This call used to run as a
+# full agent: route sessions ran up to 11 turns of Bash `rg` over
+# ~/Developer/GitHub, steered by meeting text other people spoke. Now: no tools,
+# no MCP, no plugins, structured output, and a hard timeout (it used to be
+# unbounded while the pipeline lock was held).
+SCHEMA='{"type":"object","properties":{"projects":{"type":"array","items":{"type":"string"}},"people":{"type":"array","items":{"type":"string"}},"thread":{"type":"string"},"confidence":{"type":"string","enum":["high","medium","low"]},"why":{"type":"string"}},"required":["projects","people","thread","confidence","why"]}'
+LLM_PY="${0:A:h}/lib/llm.py"
+[[ -f "$LLM_PY" ]] || { log "shared LLM helper missing: $LLM_PY"; exit 1; }
+errf=$(mktemp -t 95-route) || exit 1
+json=$(python3 "$LLM_PY" call --task route --prompt "$prompt" --schema "$SCHEMA" \
+           --timeout "${ROUTE_TIMEOUT:-180}" --archive-dir "$DIR/.llm" 2>"$errf")
+[[ -s "$errf" ]] && log "$(head -c 400 "$errf")"
+rm -f "$errf"
+if ! print -r -- "$json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    log "classifier returned no usable JSON; leaving meeting unrouted (will retry next run)"
     exit 0                                  # fail soft: no marker, so we retry
 fi
 

@@ -7,6 +7,10 @@
 # $MEETING_TOOLS/index/. Query it with `meeting-search`.
 #
 # Incremental: a meeting is re-embedded only if its transcript mtime changed.
+# Plain-text transcripts (single-track recordings: whisper -otxt has no
+# "[HH:MM:SS] Speaker:" lines) fall back to the SRT. If neither parses, the
+# meeting is recorded in state.json with chunks:0, so the next pass takes the
+# cheap jq fast path instead of relaunching the venv Python forever.
 # Fail-soft: if the venv cannot be built (e.g. offline on first run) we log and
 # exit 0 — search is an extra, it must never break the pipeline.
 
@@ -22,6 +26,7 @@ if [[ -z "$MEETING_TXT" || ! -s "$MEETING_TXT" ]]; then
     MEETING_TXT="$MEETING_DIR/$base.txt"
 fi
 [[ -s "$MEETING_TXT" ]] || { print -u2 "85-index: no transcript"; exit 1; }
+MEETING_SRT="${MEETING_SRT:-$MEETING_DIR/${MEETING_BASE:-${MEETING_DIR:t}}.srt}"
 
 IDX="$MEETING_TOOLS/index"
 VENV="$IDX/venv"
@@ -32,9 +37,12 @@ log() { print -r -- "85-index: $*"; }
 
 # --- cheap idempotency check (rule 6): already indexed at this mtime? --------
 mtime=$(/usr/bin/stat -f%m "$MEETING_TXT")
-if [[ -f "$STATE" && -f "$IDX/vectors.npy" ]]; then
-    cur=$(jq -r --arg d "$MEETING_DIR" '.[$d].mtime // empty' "$STATE" 2>/dev/null)
-    if [[ "$cur" == "$mtime" ]]; then
+# A chunks:0 entry (nothing parseable) is done on its own; any other entry also
+# needs vectors.npy, so a deleted index is rebuilt. Checking chunks:0 without
+# vectors.npy keeps a fresh index from relaunching Python on every pass.
+if [[ -f "$STATE" ]]; then
+    cur=$(jq -r --arg d "$MEETING_DIR" '.[$d] // empty | "\(.mtime) \(.chunks)"' "$STATE" 2>/dev/null)
+    if [[ "$cur" == "$mtime 0" || ( "${cur%% *}" == "$mtime" && -f "$IDX/vectors.npy" ) ]]; then
         log "already indexed (${MEETING_DIR:t})"
         exit 0
     fi
@@ -59,16 +67,79 @@ fi
 export HF_HOME="$IDX/hf"
 export TOKENIZERS_PARALLELISM=false HF_HUB_DISABLE_PROGRESS_BARS=1
 
-"$PY" - "$MEETING_DIR" "$MEETING_TXT" "$mtime" "$IDX" <<'PYEOF'
+"$PY" - "$MEETING_DIR" "$MEETING_TXT" "$mtime" "$IDX" "$MEETING_SRT" <<'PYEOF'
 import json, os, re, sys, tempfile, time
 import numpy as np
 
-meeting_dir, txt_path, mtime, idx = sys.argv[1:5]
+meeting_dir, txt_path, mtime, idx, srt_path = sys.argv[1:6]
 vec_path   = os.path.join(idx, "vectors.npy")
 meta_path  = os.path.join(idx, "meta.json")
 state_path = os.path.join(idx, "state.json")
 
 LINE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\]\s*([^:]+):\s*(.*)$")
+
+def alive(d):
+    """Is this indexed meeting folder still on disk?
+
+    90-title renames MEETING_DIR after we run, so on the next pipeline pass the
+    same meeting arrives under a new path. Keyed only by path, its old rows
+    would linger forever: the meeting gets indexed twice and every search
+    returns each moment twice, once under a folder that no longer exists.
+    Guard on the parent so a missing/unmounted Meetings root (where *every* dir
+    looks gone) can never wipe the index instead of pruning it.
+    """
+    if not d:
+        return True
+    parent = os.path.dirname(os.path.normpath(d))
+    return os.path.isdir(d) or not os.path.isdir(parent)
+
+def atomic(path, writer):                 # rule 3: never a half-written file
+    fd, tmp = tempfile.mkstemp(dir=idx)
+    os.close(fd)
+    os.chmod(tmp, 0o644)
+    writer(tmp)
+    os.replace(tmp, path)
+
+def save_json(obj, indent=None):
+    def w(p):
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, ensure_ascii=False, indent=indent)
+    return w
+
+def updated_state(n_chunks, source):
+    state = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except Exception:
+            state = {}
+    state = {k: v for k, v in state.items() if k != meeting_dir and alive(k)}
+    state[meeting_dir] = {"mtime": mtime, "chunks": n_chunks, "source": source,
+                          "indexed": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    return state
+
+def parse_srt(path):
+    """SRT cues as transcript lines. No speaker labels exist there, so 'Speaker'."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            blocks = re.split(r"\n\s*\n", fh.read())
+    except OSError:
+        return out
+    cue = re.compile(r"(\d+):(\d\d):(\d\d)[,.]\d+\s*-->")
+    for b in blocks:
+        rows = [r.strip() for r in b.strip().splitlines() if r.strip()]
+        m = next((cue.search(r) for r in rows if cue.search(r)), None)
+        if not m:
+            continue
+        text = " ".join(r for r in rows if not cue.search(r) and not r.isdigit()).strip()
+        if not text:
+            continue
+        h, mm, s = int(m.group(1)), m.group(2), m.group(3)
+        out.append({"ts": f"{h:02d}:{mm}:{s}", "sec": h*3600+int(mm)*60+int(s),
+                    "speaker": "Speaker", "text": text})
+    return out
 
 lines = []
 with open(txt_path, encoding="utf-8", errors="replace") as fh:
@@ -83,8 +154,18 @@ with open(txt_path, encoding="utf-8", errors="replace") as fh:
         lines.append({"ts": f"{h}:{mm}:{s}", "sec": int(h)*3600+int(mm)*60+int(s),
                       "speaker": spk.strip(), "text": text})
 
+source = "transcript"
+if not lines and srt_path and os.path.isfile(srt_path):
+    lines = parse_srt(srt_path)
+    source = "srt"
+    if lines:
+        print(f"85-index: transcript has no timestamped lines; indexing {len(lines)} SRT cues instead")
+
 if not lines:
-    print("85-index: transcript has no parseable lines; nothing to index")
+    # Remember the empty result (vectors untouched) so the next pass hits the
+    # jq fast path; a changed transcript mtime re-arms it.
+    atomic(state_path, save_json(updated_state(0, "none"), indent=2))
+    print("85-index: transcript and SRT have no parseable lines; recorded chunks:0")
     sys.exit(0)
 
 # Overlapping passages: 6 lines wide, stride 3 -> every line appears in >=2
@@ -122,21 +203,6 @@ model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2",
 emb = model.encode([c["text"] for c in chunks], normalize_embeddings=True,
                    batch_size=64, show_progress_bar=False).astype("float32")
 
-def alive(d):
-    """Is this indexed meeting folder still on disk?
-
-    90-title renames MEETING_DIR after we run, so on the next pipeline pass the
-    same meeting arrives under a new path. Keyed only by path, its old rows
-    would linger forever: the meeting gets indexed twice and every search
-    returns each moment twice, once under a folder that no longer exists.
-    Guard on the parent so a missing/unmounted Meetings root (where *every* dir
-    looks gone) can never wipe the index instead of pruning it.
-    """
-    if not d:
-        return True
-    parent = os.path.dirname(os.path.normpath(d))
-    return os.path.isdir(d) or not os.path.isdir(parent)
-
 # Load existing index, drop previous chunks for THIS meeting (re-index) and any
 # meeting whose folder has since been renamed or deleted.
 if os.path.exists(vec_path) and os.path.exists(meta_path):
@@ -154,33 +220,11 @@ else:
 vecs = np.vstack([old_vecs, emb]) if len(old_meta) else emb
 meta = old_meta + chunks
 
-state = {}
-if os.path.exists(state_path):
-    try:
-        with open(state_path, encoding="utf-8") as fh:
-            state = json.load(fh)
-    except Exception:
-        state = {}
-state = {k: v for k, v in state.items() if k != meeting_dir and alive(k)}
-state[meeting_dir] = {"mtime": mtime, "chunks": len(chunks),
-                      "indexed": time.strftime("%Y-%m-%dT%H:%M:%S")}
-
-def atomic(path, writer):                 # rule 3: never a half-written file
-    fd, tmp = tempfile.mkstemp(dir=idx)
-    os.close(fd)
-    os.chmod(tmp, 0o644)
-    writer(tmp)
-    os.replace(tmp, path)
+state = updated_state(len(chunks), source)
 
 def save_npy(p):        # pass a file object: np.save(path) would append ".npy"
     with open(p, "wb") as fh:
         np.save(fh, vecs, allow_pickle=False)
-
-def save_json(obj, indent=None):
-    def w(p):
-        with open(p, "w", encoding="utf-8") as fh:
-            json.dump(obj, fh, ensure_ascii=False, indent=indent)
-    return w
 
 atomic(vec_path, save_npy)
 atomic(meta_path, save_json(meta))

@@ -36,29 +36,20 @@ if [ ! -s "$MEETING_TXT" ]; then
   exit 1
 fi
 
-# Resolve the claude CLI. meeting-process appends $HOME/.local/bin to PATH, but do not
-# rely on the caller's PATH — fall back to the known install location.
-CLAUDE_BIN="$(command -v claude 2>/dev/null)"
-if [ -z "$CLAUDE_BIN" ] && [ -x "$HOME/.local/bin/claude" ]; then
-  CLAUDE_BIN="$HOME/.local/bin/claude"
-fi
-if [ -z "$CLAUDE_BIN" ]; then
-  echo "30-insights: claude CLI not found (PATH or ~/.local/bin)" >&2
+# Every LLM call goes through the shared hardened helper (lib/llm.py, installed
+# next to the modules): no tools, no MCP servers, no plugins/hooks, no session
+# transcript on disk, the user's default model, and a hard timeout (the helper
+# kills claude's whole process group) so a hung call cannot wedge the pipeline.
+LLM_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/llm.py"
+if [ ! -f "$LLM_PY" ]; then
+  echo "30-insights: shared LLM helper missing: $LLM_PY" >&2
   exit 1
 fi
-
-# Bound the LLM call so a hung `claude -p` can never wedge the unattended pipeline
-# (README rule 5). `timeout` is optional — degrade to an unbounded call if absent.
-TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)"
 CLAUDE_TIMEOUT="${INSIGHTS_TIMEOUT:-600}"
 
-run_claude() {
-  if [ -n "$TIMEOUT_BIN" ]; then
-    "$TIMEOUT_BIN" "$CLAUDE_TIMEOUT" "$CLAUDE_BIN" -p
-  else
-    "$CLAUDE_BIN" -p
-  fi
-}
+# Structured output: the CLI validates the reply against this, so there is no
+# prose or fence to strip. Items stay loose objects; the checks below still run.
+SCHEMA='{"type":"object","properties":{"questions_to_you":{"type":"array","items":{"type":"object"}},"decisions":{"type":"array","items":{"type":"object"}},"commitments":{"type":"array","items":{"type":"object"}},"deadlines":{"type":"array","items":{"type":"object"}},"jargon":{"type":"array","items":{"type":"object"}},"numbers":{"type":"array","items":{"type":"object"}}},"required":["questions_to_you","decisions","commitments","deadlines","jargon","numbers"]}'
 
 TMPDIR_ME="$(mktemp -d "${TMPDIR:-/tmp}/30-insights.XXXXXX")" || exit 1
 trap 'rm -rf "$TMPDIR_ME"' EXIT INT TERM
@@ -78,7 +69,7 @@ scientific / bioinformatics lab meeting. Lines look like:
 everyone else (one merged system-audio track — you cannot tell those speakers apart,
 so attribute them as "Participants" unless the transcript names someone explicitly).
 
-Output ONE JSON object and nothing else. No prose, no markdown fences. Schema:
+Return ONE JSON object as structured output. Schema:
 
 {
   "questions_to_you": [
@@ -129,7 +120,7 @@ Rules — follow exactly:
 - Any category with nothing grounded in the transcript must be an empty array [].
   An empty array is a correct answer. Padding it with guesses is a failure.
 
-The transcript follows.
+The transcript is on stdin.
 EOP
 
 echo "30-insights: extracting insights for $MEETING_BASE (this can take a minute)..."
@@ -138,19 +129,18 @@ echo "30-insights: extracting insights for $MEETING_BASE (this can take a minute
 attempt=1
 ok=0
 while [ "$attempt" -le 2 ]; do
-  {
-    printf '%s\n\n=== TRANSCRIPT: %s ===\n\n' "$PROMPT" "$MEETING_BASE"
-    cat "$MEETING_TXT"
-  } > "$TMPDIR_ME/prompt.txt"
-
+  prompt="$PROMPT"
   if [ "$attempt" -eq 2 ]; then
-    printf '\n\nREMINDER: reply with the raw JSON object ONLY. No fences, no commentary.\n' \
-      >> "$TMPDIR_ME/prompt.txt"
+    prompt="$prompt
+
+REMINDER: return the JSON object ONLY, with all six keys."
   fi
 
-  # Feed the prompt on stdin, not argv: a long transcript as a command-line argument
-  # blows past ARG_MAX (~1MB) and exec fails outright.
-  if run_claude < "$TMPDIR_ME/prompt.txt" > "$RAW" 2>"$TMPDIR_ME/err.txt"; then
+  # The transcript goes on stdin, not argv: a long transcript as a command-line
+  # argument blows past ARG_MAX (~1MB) and exec fails outright.
+  if python3 "$LLM_PY" call --task insights --prompt "$prompt" --stdin "$MEETING_TXT" \
+       --schema "$SCHEMA" --timeout "$CLAUDE_TIMEOUT" --archive-dir "$MEETING_DIR/.llm" \
+       > "$RAW" 2>"$TMPDIR_ME/err.txt"; then
     # Strip any ``` fences / leading chatter, keep the outermost {...} block, validate.
     if python3 - "$RAW" "$JSON_TMP" <<'PY'
 import json, re, sys

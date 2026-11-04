@@ -8,6 +8,12 @@
 #
 # Outputs: <base>_speakers.json, <base>_diarized.txt
 # Degrades gracefully (exit 0) if the venv/model cannot be built.
+#
+# Deterministic "nothing to diarize" outcomes (no participants track, no SRT cue
+# long enough to embed) write <MEETING_DIR>/.speakers-skip instead, so torch is
+# not imported and the track not decoded again on every pass. The marker is keyed
+# on the SRT's mtime and size: a re-transcription re-arms the module.
+# Transient failures (deps, model download, ffmpeg errors) never write it.
 
 set -uo pipefail
 
@@ -22,6 +28,7 @@ MEETING_TOOLS="${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}"
 
 OUT_JSON="$MEETING_DIR/${MEETING_BASE}_speakers.json"
 OUT_TXT="$MEETING_DIR/${MEETING_BASE}_diarized.txt"
+SKIP="$MEETING_DIR/.speakers-skip"
 
 # Rule 1/6: cheap idempotency check first.
 if [ -s "$OUT_JSON" ] && [ -s "$OUT_TXT" ]; then
@@ -31,6 +38,12 @@ fi
 
 [ -s "$MEETING_TXT" ] || { echo "[speakers] no transcript, skipping" >&2; exit 0; }
 [ -s "$MEETING_SRT" ] || { echo "[speakers] no SRT (need segment timestamps), skipping" >&2; exit 0; }
+# Explicit BSD stat (GNU coreutils may shadow `stat` on an interactive PATH).
+SRT_KEY="$(/usr/bin/stat -f '%m:%z' "$MEETING_SRT" 2>/dev/null)"
+if [ -f "$SKIP" ] && [ -n "$SRT_KEY" ] && [ "$(head -n 1 "$SKIP")" = "srt=$SRT_KEY" ]; then
+    echo "[speakers] skipped earlier ($(sed -n 2p "$SKIP")); rm .speakers-skip to retry"
+    exit 0
+fi
 [ -f "$MEETING_MKV" ] || { echo "[speakers] no recording, skipping" >&2; exit 0; }
 
 TOOLDIR="$MEETING_TOOLS/speakers"
@@ -54,10 +67,10 @@ if [ ! -f "$READY" ] || [ ! -x "$PY" ]; then
     touch "$READY"
 fi
 
-export MEETING_DIR MEETING_BASE MEETING_MKV MEETING_TXT MEETING_SRT TOOLDIR OUT_JSON OUT_TXT
+export MEETING_DIR MEETING_BASE MEETING_MKV MEETING_TXT MEETING_SRT TOOLDIR OUT_JSON OUT_TXT SKIP
 
 "$PY" - <<'PYEOF'
-import json, os, re, subprocess, sys, tempfile, shutil
+import json, os, re, subprocess, sys, tempfile, shutil, time
 from bisect import bisect_right
 
 DIR    = os.environ["MEETING_DIR"]
@@ -68,6 +81,7 @@ SRT    = os.environ["MEETING_SRT"]
 TOOLS  = os.environ["TOOLDIR"]
 OUT_JSON = os.environ["OUT_JSON"]
 OUT_TXT  = os.environ["OUT_TXT"]
+SKIP     = os.environ["SKIP"]
 
 MODEL_DIR  = os.path.join(TOOLS, "models", "ecapa")
 VOICES     = os.path.join(TOOLS, "voices.json")
@@ -89,6 +103,28 @@ if os.path.isfile(os.path.join(MODEL_DIR, "hyperparams.yaml")) and \
 
 
 def log(m): print("[speakers] " + m, flush=True)
+
+
+def skip(reason):
+    """Deterministic no-output outcome: record it (atomically) and exit 0.
+
+    Line 1 is "srt=<mtime>:<size>", the key the bash idempotency check compares
+    against the current SRT, so this is decided once per transcript, not once
+    per pass. Line 2 is human-readable.
+    """
+    log(reason + "; skipping")
+    st = os.stat(SRT)
+    fd, tmp = tempfile.mkstemp(dir=DIR, prefix=".speakers-skip.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("srt=%d:%d\n%s %s\n" % (int(st.st_mtime), st.st_size,
+                                             time.strftime("%Y-%m-%dT%H:%M:%S"), reason))
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, SKIP)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    sys.exit(0)
 
 
 def ts_to_sec(h, m, s, ms=0):
@@ -117,9 +153,21 @@ def parse_srt(path):
 
 segs = parse_srt(SRT)
 if not segs:
-    log("no usable SRT segments; skipping")
-    sys.exit(0)
+    skip("no usable SRT segments")
 log("%d participant segments from SRT" % len(segs))
+
+# Cheap pre-checks (<50 ms) before importing torch and decoding the track.
+if not any(s["end"] - s["start"] >= MIN_DUR for s in segs):
+    skip("no SRT segment is at least %.1f s long" % MIN_DUR)
+pr = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a",
+                     "-show_entries", "stream=index", "-of", "csv=p=0", MKV],
+                    capture_output=True, text=True)
+if pr.returncode != 0:
+    log("ffprobe failed on the recording (%s); will retry next pass" % pr.stderr.strip()[:200])
+    sys.exit(0)
+n_audio = len([l for l in pr.stdout.splitlines() if l.strip()])
+if n_audio < 3:
+    skip("recording has %d audio track(s); no participants track (a:2)" % n_audio)
 
 try:
     import numpy as np
@@ -189,8 +237,7 @@ try:
         embs.append(e / n)
         idx_embedded.append(i)
     if not embs:
-        log("no segment long enough to embed; skipping")
-        sys.exit(0)
+        skip("no segment long enough to embed")
     X = np.vstack(embs)
     log("embedded %d/%d segments (%d-dim)" % (len(X), len(segs), X.shape[1]))
 

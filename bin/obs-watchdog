@@ -15,58 +15,343 @@
 # Unlike bin/meeting-process, this does NOT need ~/Documents access (see
 # CLAUDE.md's launchd note) — it only signals/relaunches OBS and stats files
 # under ~/Library and ~/Recordings — so launchd is fine here.
+#
+# Lessons from the first version (which logged 235 "restarts" in 30 days, most
+# of them useless or harmful):
+#   * A stale heartbeat across system sleep is not a hang. Killing OBS during a
+#     DarkWake left it on the "Crash or unclean shutdown detected" / Safe Mode
+#     prompt for hours, with no script loaded and no way to record. Staleness
+#     is now measured only across full-wake time (kern.waketime + a
+#     full-wake-since stamp), and nothing happens while in DarkWake.
+#   * If the heartbeat predates the current OBS process, the script never
+#     loaded in it — OBS is sitting on a startup dialog. Killing it again just
+#     recreates the dialog, so the watchdog notifies the user instead.
+#   * "OBS restarted" was logged without checking; the kill often didn't take
+#     and the same PID survived hundreds of "restarts". The restart now quits
+#     gracefully (15 s), escalates to SIGTERM then SIGKILL on the recorded PID
+#     only, confirms a new PID appeared, and logs what really happened.
+#   * Restarting can't fix a freeze that recurs on every load. The first
+#     restart happens as soon as the heartbeat is stale; restarts 2 and 3 wait
+#     at least 10 and 20 min after the previous one, and the watchdog gives up
+#     40 min after the 3rd (MAX_RESTARTS) if the heartbeat never sustained a
+#     recovery, posting a persistent alert instead.
+#
+# OBS 33.0.1 has NO --disable-shutdown-check flag (verified against the
+# binary's own option list), so the relaunch cannot suppress the unclean-
+# shutdown prompt; the graceful quit above is what keeps shutdowns clean.
+#
+# Testing: DRY_RUN=1 logs instead of quitting/killing/relaunching/notifying,
+# and does not write the real state file (so a dry run while OBS is actually
+# broken can't burn a restart attempt or suppress the dialog notification).
+# It still appends to the log. State is only written in DRY_RUN when
+# OBS_WATCHDOG_STATE is set explicitly, e.g. to a scratch path for tests.
+# The OBS_WATCHDOG_* variables below override paths and probed values so the
+# state machine can be exercised offline against a fake heartbeat file.
 
 set -u
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export LC_ALL=C   # ps lstart / date -j parsing below assume English month/day names
 
-HEARTBEAT_FILE="$HOME/Library/Logs/meeting-notify.heartbeat"
-NOTIFY_LOG="$HOME/Library/Logs/meeting-notify.log"
-MEETINGS_DIR="$HOME/Recordings/Meetings"
+HEARTBEAT_FILE="${OBS_WATCHDOG_HEARTBEAT:-$HOME/Library/Logs/meeting-notify.heartbeat}"
+NOTIFY_LOG="${OBS_WATCHDOG_LOG:-$HOME/Library/Logs/meeting-notify.log}"
+MEETINGS_DIR="${OBS_WATCHDOG_MEETINGS:-$HOME/Recordings/Meetings}"
+STATE_FILE="${OBS_WATCHDOG_STATE:-${MEETING_TOOLS:-$HOME/.local/share/meeting-tools}/obs-watchdog/state}"
+DRY_RUN="${DRY_RUN:-0}"
+OBS_BUNDLE_ID="com.obsproject.obs-studio"
 
-STALE_SECS=300        # tick() heartbeats every 60s when healthy; 5x that is unhealthy, not just slow
-STARTUP_GRACE_SECS=180 # ignore a missing/stale heartbeat right after OBS (re)launches
+STALE_SECS=300           # tick() heartbeats every 60s when healthy; 5x that is unhealthy, not just slow
+STARTUP_GRACE_SECS=180   # ignore a missing/stale heartbeat right after OBS (re)launches
 RECORDING_GRACE_SECS=120 # never restart OBS while an mkv looks actively written
+QUIT_GRACE_SECS=15       # graceful quit lets OBS save its scene collection and clear its crash sentinel
+TERM_GRACE_SECS=5
+KILL_GRACE_SECS=5
+RELAUNCH_WAIT_SECS=30    # how long to wait for the relaunched OBS process to appear
+RECOVERY_SECS=1800       # heartbeat must still be fresh this long after a restart to count as "recovered"
+BACKOFF_MINS=(10 20 40)  # BACKOFF_MINS[n] = min gap after the nth restart before acting again; the last is the wait before giving up
+MAX_RESTARTS=3
 
-now=$(date +%s)
+now=${OBS_WATCHDOG_NOW:-$(/bin/date +%s)}
 
 log() {
-    print -r -- "$(date '+%Y-%m-%d %H:%M:%S') [obs-watchdog] $1" >> "$NOTIFY_LOG"
+    print -r -- "$(/bin/date '+%Y-%m-%d %H:%M:%S') [obs-watchdog] $1" >> "$NOTIFY_LOG"
 }
 
-obs_pid=$(pgrep -f "OBS\.app/Contents/MacOS/OBS" | head -1)
+# AppleScript string literal escaping: backslash and double quote.
+notify() {  # notify <title> <message>
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY_RUN: would notify: $1 — $2"
+        return
+    fi
+    /usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv) sound name "Basso"' -e 'end run' -- "$1" "$2" >/dev/null 2>&1
+}
+
+# A notification banner disappears; giving up on OBS needs something that
+# stays on screen until acknowledged. display alert blocks until dismissed, so
+# it is backgrounded and disowned (the plist sets AbandonProcessGroup so launchd
+# doesn't reap it when this job exits). Posted once per give-up, never per run.
+alert_persistent() {  # alert_persistent <title> <message>
+    if [[ "$DRY_RUN" == 1 ]]; then
+        log "DRY_RUN: would post persistent alert: $1 — $2"
+        return
+    fi
+    notify "$1" "$2"
+    /usr/bin/osascript -e 'on run argv' -e 'display alert (item 1 of argv) message (item 2 of argv) as critical' -e 'end run' -- "$1" "$2" >/dev/null 2>&1 &!
+}
+
+# --- persisted state ------------------------------------------------------
+# Plain key=value lines, integers only. Parsed field-by-field (never sourced)
+# so a corrupt file can't execute anything; unknown keys/garbage are ignored.
+typeset -A st
+st=(restarts 0 last_restart 0 gave_up 0 gave_up_pid 0 dialog_pid 0 fullwake_since 0)
+
+load_state() {
+    [[ -r "$STATE_FILE" ]] || return 0
+    local k v
+    while IFS='=' read -r k v; do
+        [[ -n "${st[$k]+x}" && "$v" == <-> ]] && st[$k]=$v
+    done < "$STATE_FILE"
+}
+
+save_state() {
+    local dir=${STATE_FILE:h} tmp k
+    if [[ "$DRY_RUN" == 1 && -z "${OBS_WATCHDOG_STATE:-}" ]]; then
+        log "DRY_RUN: not saving state (restarts=${st[restarts]} dialog_pid=${st[dialog_pid]}); set OBS_WATCHDOG_STATE to a scratch path to test state transitions"
+        return 0
+    fi
+    /bin/mkdir -p "$dir" 2>/dev/null || { log "cannot create state dir $dir"; return 1; }
+    tmp="$STATE_FILE.tmp.$$"
+    {
+        for k in ${(ko)st}; do print -r -- "$k=${st[$k]}"; done
+    } > "$tmp" && /bin/mv -f "$tmp" "$STATE_FILE" || { /bin/rm -f "$tmp"; log "cannot write state $STATE_FILE"; return 1; }
+}
+
+reset_restarts() {
+    st[restarts]=0; st[last_restart]=0; st[gave_up]=0; st[gave_up_pid]=0
+}
+
+# --- probes ---------------------------------------------------------------
+obs_pid_now() {
+    if [[ -n "${OBS_WATCHDOG_PID+x}" ]]; then print -r -- "$OBS_WATCHDOG_PID"; return; fi
+    /usr/bin/pgrep -x OBS 2>/dev/null | head -1
+}
+
+pid_alive() { [[ -n "$1" ]] && /bin/kill -0 "$1" 2>/dev/null; }
+
+# Seconds since the epoch of the last wake (DarkWake or full). 0 if never slept.
+last_wake() {
+    if [[ -n "${OBS_WATCHDOG_WAKETIME+x}" ]]; then print -r -- "$OBS_WATCHDOG_WAKETIME"; return; fi
+    local out
+    out=$(/usr/sbin/sysctl -n kern.waketime 2>/dev/null)   # "{ sec = 1793826193, usec = 55361 } Wed Nov ..."
+    if [[ "$out" =~ 'sec = ([0-9]+)' ]]; then print -r -- "$match[1]"; else print 0; fi
+}
+
+# Full wake vs DarkWake. During a DarkWake (power nap / maintenance wake) the
+# system has no Graphics capability and OBS's timers barely run; a missing
+# heartbeat then says nothing about the Lua VM. `pmset -g systemstate` prints
+# e.g. "Current System Capabilities are: CPU Graphics Audio Network" in full
+# wake. Prints 1 (full wake), 0 (DarkWake) — and 1 if the output is not
+# recognised, so an OS format change can't silently disable the watchdog
+# (the kern.waketime rule still applies).
+full_wake() {
+    if [[ -n "${OBS_WATCHDOG_FULLWAKE+x}" ]]; then print -r -- "$OBS_WATCHDOG_FULLWAKE"; return; fi
+    local out
+    out=$(/usr/bin/pmset -g systemstate 2>/dev/null)
+    if [[ "$out" != *"System Capabilities"* ]]; then print 1
+    elif [[ "$out" == *Graphics* ]]; then print 1
+    else print 0
+    fi
+}
+
+obs_start_time() {  # obs_start_time <pid>; empty on failure
+    if [[ -n "${OBS_WATCHDOG_OBS_START+x}" ]]; then print -r -- "$OBS_WATCHDOG_OBS_START"; return; fi
+    setopt localoptions extendedglob   # needed for the ## repetition operator below
+    local lstart
+    lstart=$(/bin/ps -o lstart= -p "$1" 2>/dev/null) || return 0
+    # ps pads lstart with spaces; BSD date only tolerates trailing junk with a
+    # warning, so trim it rather than rely on that leniency.
+    lstart=${${lstart##[[:space:]]##}%%[[:space:]]##}
+    [[ -n "$lstart" ]] && /bin/date -j -f "%a %b %d %T %Y" "$lstart" +%s 2>/dev/null
+}
+
+# --- restart --------------------------------------------------------------
+# Quit OBS (pid $1) gracefully, escalate on that PID only, relaunch, and confirm
+# a new PID. Sets restart_result to a human-readable outcome; returns 0 only if
+# a new OBS process is confirmed running.
+restart_result=""
+restart_obs() {
+    local old=$1 how="" i osa new=""
+    if [[ "$DRY_RUN" == 1 ]]; then
+        restart_result="DRY_RUN: would quit pid $old (grace ${QUIT_GRACE_SECS}s, then SIGTERM/SIGKILL) and relaunch OBS"
+        return 0
+    fi
+
+    # The AppleEvent can itself hang against a wedged app, so it runs in the
+    # background and we poll the PID; the timeout block bounds its lifetime.
+    /usr/bin/osascript -e "with timeout of $QUIT_GRACE_SECS seconds" \
+        -e "tell application id \"$OBS_BUNDLE_ID\" to quit" -e "end timeout" >/dev/null 2>&1 &
+    osa=$!
+    for (( i = 0; i < QUIT_GRACE_SECS; i++ )); do
+        pid_alive "$old" || { how="quit"; break; }
+        sleep 1
+    done
+    /bin/kill "$osa" 2>/dev/null
+
+    if [[ -z "$how" ]]; then
+        /bin/kill -TERM "$old" 2>/dev/null
+        for (( i = 0; i < TERM_GRACE_SECS; i++ )); do
+            pid_alive "$old" || { how="SIGTERM"; break; }
+            sleep 1
+        done
+    fi
+    if [[ -z "$how" ]]; then
+        /bin/kill -KILL "$old" 2>/dev/null
+        for (( i = 0; i < KILL_GRACE_SECS; i++ )); do
+            pid_alive "$old" || { how="SIGKILL"; break; }
+            sleep 1
+        done
+    fi
+    if [[ -z "$how" ]]; then
+        restart_result="FAILED: pid $old still alive after quit, SIGTERM and SIGKILL; not relaunching"
+        return 1
+    fi
+
+    /usr/bin/open -b "$OBS_BUNDLE_ID" >/dev/null 2>&1
+    for (( i = 0; i < RELAUNCH_WAIT_SECS; i++ )); do
+        new=$(/usr/bin/pgrep -x OBS 2>/dev/null | head -1)
+        [[ -n "$new" && "$new" != "$old" ]] && break
+        new=""
+        sleep 1
+    done
+    if [[ -z "$new" ]]; then
+        restart_result="FAILED: old pid $old exited via $how, but no new OBS process within ${RELAUNCH_WAIT_SECS}s of relaunch"
+        return 1
+    fi
+    restart_result="OBS restarted by watchdog: old pid $old exited via $how; new pid $new"
+    return 0
+}
+
+# --- main -----------------------------------------------------------------
+load_state
+
+obs_pid=$(obs_pid_now)
 if [[ -z "$obs_pid" ]]; then
     exit 0   # OBS isn't running; not this watchdog's job to launch it fresh
 fi
 
-obs_start=$(ps -o lstart= -p "$obs_pid" 2>/dev/null | xargs -I{} date -j -f "%a %b %d %T %Y" "{}" +%s 2>/dev/null || echo "$now")
+obs_start=$(obs_start_time "$obs_pid")
+if [[ "$obs_start" != <-> ]]; then
+    log "could not read start time of OBS pid $obs_pid; skipping this run"
+    exit 0
+fi
 if (( now - obs_start < STARTUP_GRACE_SECS )); then
     exit 0   # give script_load's own initial heartbeat write time to land
 fi
 
 if [[ -f "$HEARTBEAT_FILE" ]]; then
-    last_beat=$(stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
+    last_beat=$(/usr/bin/stat -f %m "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
 else
     last_beat=0
 fi
 
-if (( now - last_beat < STALE_SECS )); then
-    exit 0   # heartbeat is fresh; script is alive
+# Sleep awareness. In DarkWake do nothing and forget any full-wake stamp, so the
+# next full wake starts a fresh STALE_SECS window.
+if [[ "$(full_wake)" != 1 ]]; then
+    if (( st[fullwake_since] != 0 )); then st[fullwake_since]=0; save_state; fi
+    exit 0
+fi
+state_dirty=0
+if (( st[fullwake_since] == 0 )); then st[fullwake_since]=$now; state_dirty=1; fi
+
+beat_age=$(( now - last_beat ))
+
+# Healthy. A restart only counts as having worked if the heartbeat has stayed
+# alive for RECOVERY_SECS since — the observed failure mode is the Lua VM
+# re-freezing minutes after every relaunch, which a single fresh beat would hide.
+if (( beat_age < STALE_SECS )); then
+    if (( st[dialog_pid] != 0 )); then st[dialog_pid]=0; state_dirty=1; fi
+    if (( st[restarts] > 0 || st[gave_up] )) && (( now - st[last_restart] >= RECOVERY_SECS )); then
+        log "heartbeat healthy for $(( now - st[last_restart] ))s after ${st[restarts]} watchdog restart(s); resetting backoff"
+        reset_restarts; state_dirty=1
+    fi
+    (( state_dirty )) && save_state
+    exit 0
+fi
+
+# Awake-time staleness: count only time since the latest of the last beat, the
+# last wake, and the first full-wake run we saw. Timers don't fire in sleep, so
+# a beat that predates the wake hasn't had a fair chance to resume yet.
+waketime=$(last_wake)
+ref=$last_beat
+(( waketime > ref )) && ref=$waketime
+(( st[fullwake_since] > ref )) && ref=${st[fullwake_since]}
+if (( now - ref < STALE_SECS )); then
+    (( state_dirty )) && save_state
+    exit 0
 fi
 
 # Never kill OBS mid-recording, even on a false positive: an actively-written
 # mkv is the one signal that matters more than a stuck repair loop.
-newest_mkv=$(find "$MEETINGS_DIR" -name '*.mkv' -newermt "-${RECORDING_GRACE_SECS}seconds" -print -quit 2>/dev/null)
+newest_mkv=$(/usr/bin/find "$MEETINGS_DIR" -name '*.mkv' -newermt "-${RECORDING_GRACE_SECS}seconds" -print -quit 2>/dev/null)
 if [[ -n "$newest_mkv" ]]; then
+    (( state_dirty )) && save_state
     exit 0
 fi
 
-log "heartbeat stale for $((now - last_beat))s — meeting-notify.lua looks hung; restarting OBS"
-osascript -e 'quit app "OBS"' >/dev/null 2>&1
-for _ in 1 2 3 4 5; do
-    pgrep -f "OBS\.app/Contents/MacOS/OBS" >/dev/null 2>&1 || break
-    sleep 1
-done
-pkill -f "OBS\.app/Contents/MacOS/OBS" >/dev/null 2>&1
-sleep 1
-open -a OBS
-log "OBS restarted by watchdog"
+# The heartbeat predates this OBS process: the script never loaded in it.
+# That's OBS stuck before script load (the unclean-shutdown / Safe Mode prompt,
+# a missing-files dialog, or the script was removed) — a kill would only bring
+# the prompt back. Tell the user once per OBS process.
+if (( last_beat <= obs_start )); then
+    if (( st[dialog_pid] != obs_pid )); then
+        if (( last_beat > 0 )); then beat_desc="last heartbeat ${beat_age}s ago"; else beat_desc="no heartbeat file"; fi
+        log "OBS pid $obs_pid (up $(( now - obs_start ))s) never ran meeting-notify.lua ($beat_desc) — probably waiting on a startup dialog; not restarting"
+        notify "OBS is waiting on a dialog" "meeting-notify.lua has not loaded since OBS started — check OBS for a Safe Mode / crash prompt. Meetings will not be recorded until it is answered."
+        st[dialog_pid]=$obs_pid; state_dirty=1
+    fi
+    (( state_dirty )) && save_state
+    exit 0
+fi
+
+# Gave up earlier: stay quiet until the user restarts OBS themselves (new PID)
+# or the heartbeat recovers (handled above).
+if (( st[gave_up] )); then
+    if (( st[gave_up_pid] != obs_pid )); then
+        log "OBS pid changed ${st[gave_up_pid]} -> $obs_pid since the watchdog gave up; re-arming"
+        reset_restarts; state_dirty=1
+    else
+        (( state_dirty )) && save_state
+        exit 0
+    fi
+fi
+
+# Backoff: after n restarts without recovery, wait BACKOFF_MINS[n] minutes.
+if (( st[restarts] > 0 )); then
+    gap_mins=${BACKOFF_MINS[st[restarts]]:-${BACKOFF_MINS[-1]}}
+    if (( now - st[last_restart] < gap_mins * 60 )); then
+        (( state_dirty )) && save_state
+        exit 0
+    fi
+fi
+
+if (( st[restarts] >= MAX_RESTARTS )); then
+    log "heartbeat stale for ${beat_age}s after ${st[restarts]} watchdog restarts without recovery — giving up on OBS pid $obs_pid until it is restarted by hand"
+    alert_persistent "Meeting recorder: OBS script keeps hanging" \
+        "meeting-notify.lua stopped heartbeating after ${st[restarts]} automatic OBS restarts. Recording health is unknown: check OBS (Tools > Scripts > Script Log) and restart it by hand."
+    st[gave_up]=1; st[gave_up_pid]=$obs_pid
+    save_state
+    exit 0
+fi
+
+attempt=$(( st[restarts] + 1 ))
+log "heartbeat stale for ${beat_age}s (awake $(( now - ref ))s) — meeting-notify.lua looks hung; restarting OBS pid $obs_pid (attempt $attempt/$MAX_RESTARTS)"
+# Count the attempt before acting, so a crash mid-restart still advances backoff.
+st[restarts]=$attempt; st[last_restart]=$now; st[dialog_pid]=0
+save_state
+
+if restart_obs "$obs_pid"; then
+    log "$restart_result"
+    notify "OBS restarted by watchdog" "meeting-notify.lua had stopped responding (attempt $attempt/$MAX_RESTARTS)."
+else
+    log "$restart_result"
+    notify "OBS watchdog restart failed" "$restart_result"
+fi

@@ -105,10 +105,15 @@ if (( ! RERANK )); then
 fi
 
 print -u2 "meeting-search: reranking with claude…"
+# Through the pipeline's shared hardened helper (modules/lib/llm.py): the
+# passages are other people's speech, so no tools, no MCP servers, no plugins,
+# and no copy of them under ~/.claude/projects. Same default model as before.
+LLM_PY="$HOME/.local/share/meeting-modules/lib/llm.py"
+[[ -f "$LLM_PY" ]] || { print -u2 "meeting-search: shared LLM helper missing: $LLM_PY"; exit 1; }
 print -r -- "QUESTION: $QUERY
 
 CANDIDATE PASSAGES (from transcripts of recorded meetings; 'You' is the person
 who recorded the meeting, 'Participants' is everyone else; timestamps are from
 the start of that recording):
 
-$hits" | claude -p "You are searching a personal archive of meeting transcripts. Below is a question followed by candidate transcript passages retrieved by semantic search (they are noisy auto-transcriptions and some are irrelevant). Answer the question in 2-5 sentences of plain prose, based ONLY on the passages. Cite the meeting folder name and timestamp for every claim, e.g. (2026-07-14_12-33_meeting [00:12:34]). If the passages do not actually answer the question, say so plainly instead of guessing. Then list the 1-3 most relevant passages as 'meeting [timestamp] — why it matters'."
+$hits" | python3 "$LLM_PY" call --task search --stdin - --timeout 300 --no-refusal-check --prompt "You are searching a personal archive of meeting transcripts. Below is a question followed by candidate transcript passages retrieved by semantic search (they are noisy auto-transcriptions and some are irrelevant). Answer the question in 2-5 sentences of plain prose, based ONLY on the passages. Cite the meeting folder name and timestamp for every claim, e.g. (2026-07-14_12-33_meeting [00:12:34]). If the passages do not actually answer the question, say so plainly instead of guessing. Then list the 1-3 most relevant passages as 'meeting [timestamp] — why it matters'."
